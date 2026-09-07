@@ -30,7 +30,8 @@ try {
         Write-Host "`n[DRY RUN] Would execute:" -ForegroundColor Yellow
         Write-Host "  cd '$ExtensionDir'"
         Write-Host "  npx vsce package"
-        Write-Host "  code --install-extension '$(Join-Path $ExtensionDir 'codesys-v2-text-editor-0.0.1.vsix')'"
+        $VsixPath = Join-Path $ExtensionDir "codesys-v2-text-editor-0.0.1.vsix"
+        Write-Host "  code --install-extension '$VsixPath'"
         Write-Host ""
         exit 0
     }
