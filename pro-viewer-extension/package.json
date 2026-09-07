@@ -1,0 +1,32 @@
+{
+  "name": "codesys-v2-text-editor",
+  "displayName": "CoDeSys V2.3 Text Editor",
+  "description": "Read-only decoded text view of CoDeSys V2.3 / TwinCat .pro project files",
+  "version": "0.0.1",
+  "publisher": "local-daifuku",
+  "private": true,
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": ["Other"],
+  "activationEvents": [],
+  "main": "./extension.js",
+  "contributes": {
+    "customEditors": [
+      {
+        "viewType": "twincatProViewer.decoded",
+        "displayName": "CoDeSys V2.3 Text Editor",
+        "selector": [
+          { "filenamePattern": "*.pro" }
+        ],
+        "priority": "default"
+      }
+    ],
+    "commands": [
+      {
+        "command": "twincatProViewer.exportPous",
+        "title": "CoDeSys V2.3 Text Editor: Export Decoded POUs to Text Files"
+      }
+    ]
+  }
+}
