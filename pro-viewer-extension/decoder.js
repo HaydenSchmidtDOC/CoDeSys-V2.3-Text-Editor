@@ -69,8 +69,9 @@ const LD_TIMELIT_TAG = 0x41;
 // confirmed against BagFound (R_TRIG, no PT) vs RunToRearTimer (TON, has PT).
 const LD_FBTYPE_TAG = 0x40;
 
-/** Renders a leaf node: a contact ({name, negated}) or a timer/FB-instance
- * ({name, fb: true, fbType, pt}) - see decodeLadderBody. */
+/** Renders a leaf node as a flat fallback string (used only when the tree
+ * couldn't be trusted - see renderLadderNetworks' !treeOk branch): a contact
+ * ({name, negated}) or a timer/FB-instance ({name, fb: true, fbType, pt}). */
 function renderLeaf(node) {
 	if (!node.fb) return node.negated ? `NOT ${node.name}` : node.name;
 	const type = node.fbType ? `:${node.fbType}` : "";
@@ -78,16 +79,52 @@ function renderLeaf(node) {
 	return `${node.name}${type}(${pt})`;
 }
 
-/** Renders one node of a parsed AND/OR tree (see decodeLadderBody). A leaf is
- * a contact/FB-instance (see renderLeaf); a group node is {type: "AND"|"OR", children}. */
-function renderTreeNode(node) {
-	if (!("children" in node)) return renderLeaf(node);
-	const parts = node.children.map((child) => {
-		const rendered = renderTreeNode(child);
-		return "children" in child && child.children.length > 1 ? `(${rendered})` : rendered;
-	});
-	if (parts.length <= 1) return parts[0] || "";
-	return parts.join(node.type === "AND" ? " AND " : " OR ");
+// R_TRIG/F_TRIG only have a single boolean input pin, named CLK (see the real
+// project's own ST source, e.g. "UpperPEEdge(CLK:=OpenPEFilter.Q);") - every
+// other FB type seen in this format (TON/TOF/TP) uses IN/PT like a timer.
+const LD_FB_EDGE_TYPES = new Set(["R_TRIG", "F_TRIG"]);
+
+/**
+ * Walks a trusted AND/OR tree (see decodeLadderBody) computing, for every
+ * FB-instance leaf, the boolean expression actually wired to its input pin
+ * (`leaf.inExpr`) - i.e. the ladder rail's accumulated power at that exact
+ * position: the AND of every element preceding it in the same AND-chain,
+ * unaffected by sibling branches of an enclosing OR (a parallel split feeds
+ * the same incoming power to every branch, not an accumulation across them).
+ * Mirrors how the real project's ST source wires these same FB types
+ * (SecurityDoor: "OpenTriggerFilter(IN:=OpenDoor, PT:=t#100ms);"). Returns the
+ * node's own rendered contribution to its parent's expression - for a plain
+ * contact that's its name; for an FB leaf it's `<name>.Q`, the FB's output
+ * pin, since that (not the call itself) is what continues the rail forward -
+ * confirmed against the real project's own convention for chaining FB
+ * outputs, e.g. "UpperPEEdge(CLK:=OpenPEFilter.Q)".
+ */
+function assignFbWiring(node, incoming) {
+	if (!("children" in node)) {
+		if (node.fb) {
+			node.inExpr = incoming;
+			return `${node.name}.Q`;
+		}
+		return node.negated ? `NOT ${node.name}` : node.name;
+	}
+	const parts = [];
+	let acc = incoming;
+	for (const child of node.children) {
+		const childStr = assignFbWiring(child, node.type === "AND" ? acc : incoming);
+		const wrapped = "children" in child && child.children.length > 1 ? `(${childStr})` : childStr;
+		parts.push(wrapped);
+		if (node.type === "AND") acc = acc === "TRUE" ? wrapped : `${acc} AND ${wrapped}`;
+	}
+	return parts.length <= 1 ? parts[0] || "" : parts.join(node.type === "AND" ? " AND " : " OR ");
+}
+
+/** Renders an FB-instance leaf as a standalone call statement, ST-style,
+ * using the `inExpr` wiring computed by assignFbWiring. */
+function renderFbCall(leaf) {
+	const pin = LD_FB_EDGE_TYPES.has(leaf.fbType) ? "CLK" : "IN";
+	const args = [`${pin}:=${leaf.inExpr}`];
+	if (leaf.pt) args.push(`PT:=${leaf.pt}`);
+	return `${leaf.name}(${args.join(", ")});`;
 }
 
 /**
@@ -276,6 +313,18 @@ function decodeLadderBody(buf, startOffset, endOffset) {
 					fbType = nextRec.name;
 					consumedEnd = nextRec.offset + 2 + nextRec.name.length;
 					consumedByFb.add(ri + 1);
+					// FB types with no operand (e.g. R_TRIG/F_TRIG) have a shorter,
+					// all-zero 6-byte trailer instead of the timer types' 8-byte one -
+					// confirmed identical across every R_TRIG instance in the corpus
+					// (BagFound, PEHit1, PEHit2). Same reasoning as the timer case:
+					// skip it exactly so the real gap byte for the next element (e.g.
+					// Intrusion NETWORK 2's second AND-group, opened right after
+					// PEHit1) isn't drowned out by this FB's own trailing bytes.
+					const trailer = buf.subarray(consumedEnd, consumedEnd + 6);
+					if (trailer.length === 6 && trailer.every((b) => b === 0)) {
+						consumedEnd += 6;
+						fbTrailerConsumed = true;
+					}
 				}
 				leaf = { name: rec.name, fb: true, fbType, pt };
 			}
@@ -325,14 +374,20 @@ function renderLadderNetworks(networks) {
 	];
 	networks.forEach((net, idx) => {
 		let condStr;
+		let fbCalls = [];
 		if (!net.elements.length) {
 			condStr = "(no contacts decoded)";
 		} else if (net.treeOk) {
-			condStr = renderTreeNode(net.tree);
+			condStr = assignFbWiring(net.tree, "TRUE");
+			// Emit each FB instance as its own labeled call statement (IN/CLK + PT
+			// wiring, ST-style - matches how the real project's own ST source calls
+			// these same FB types), in rung order, before the IF that uses their .Q.
+			fbCalls = net.elements.filter((el) => el.fb).map(renderFbCall);
 		} else {
 			condStr = net.elements.map(renderLeaf).join(" <AND/OR: MIXED, unresolved> ");
 		}
 		lines.push(`NETWORK ${idx + 1}:`);
+		for (const call of fbCalls) lines.push(`  ${call}`);
 		lines.push(`  IF ${condStr} THEN`);
 		if (net.outputs.length) {
 			for (const out of net.outputs) {

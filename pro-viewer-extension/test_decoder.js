@@ -130,7 +130,8 @@ const timerNet = Buffer.from([
 const timerNets = decodeLadderBody(Buffer.concat([Buffer.from("PROGRAM X\r\nVAR\r\nEND_VAR", "latin1"), timerNet]), 0, 23 + timerNet.length);
 assert.strictEqual(timerNets[0].treeOk, true, "timer rung must produce a fully-balanced tree");
 const timerRendered = renderLadderNetworks(timerNets);
-assert.ok(timerRendered.includes("BRRunToPE AND RunToRearTimer:TON(PT:=T#6000ms)"), "expected decoded timer call with instance/type/PT");
+assert.ok(timerRendered.includes("RunToRearTimer(IN:=BRRunToPE, PT:=T#6000ms);"), "expected a labeled ST-style FB call statement, IN wired from the preceding contact");
+assert.ok(timerRendered.includes("IF (BRRunToPE AND RunToRearTimer.Q) THEN"), "expected the condition to reference the FB's .Q output");
 assert.ok(timerRendered.includes("BRRunToPE := NOT TRUE; // SET"), "expected the network's NEGATIV/SET output coil");
 
 // 7e. Cascaded timers with a nested group right after a non-terminal FB's own
@@ -158,8 +159,17 @@ const cascadeNets = decodeLadderBody(Buffer.concat([Buffer.from("PROGRAM X\r\nVA
 assert.strictEqual(cascadeNets[0].treeOk, true, "cascaded-timer rung must produce a fully-balanced tree");
 const cascadeRendered = renderLadderNetworks(cascadeNets);
 assert.ok(
-	cascadeRendered.includes("BRRunRel AND (RunRelJamTimer:TON(PT:=T#4000ms) OR (InductPE1 AND RunToReleaseTimer:TON(PT:=T#1000ms)))"),
+	cascadeRendered.includes("IF (BRRunRel AND (RunRelJamTimer.Q OR (InductPE1 AND RunToReleaseTimer.Q))) THEN"),
 	"expected the nested OR(FB, AND(contact, FB)) tree, not a flattened 3-way OR"
+);
+// Each FB's IN is the rail's accumulated power at its exact position: the
+// first (non-terminal, OR-branch) timer sees just the AND-chain before the
+// OR split; the second (terminal, nested inside the AND branch) additionally
+// sees the contact preceding it within that branch.
+assert.ok(cascadeRendered.includes("RunRelJamTimer(IN:=BRRunRel, PT:=T#4000ms);"), "expected first timer's IN wired from the preceding contact only");
+assert.ok(
+	cascadeRendered.includes("RunToReleaseTimer(IN:=BRRunRel AND InductPE1, PT:=T#1000ms);"),
+	"expected second timer's IN to include both the outer contact and its own branch's contact"
 );
 
 // 8. Syntax checker: balanced text passes, a dropped END_IF / stray paren fails.
