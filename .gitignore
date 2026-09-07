@@ -1,2 +1,9 @@
 node_modules/
 *.vsix.map
+/TEST CORPUS/
+/_extracted_pous/
+*.pro
+*.EXP
+*.exp
+*.BAK
+*.bak

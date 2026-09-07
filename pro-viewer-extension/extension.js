@@ -1,5 +1,5 @@
 const vscode = require("vscode");
-const { decodePro } = require("./decoder");
+const { decodePro, applyPouEdit, checkStSyntax } = require("./decoder");
 
 function escapeHtml(s) {
 	return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -7,14 +7,20 @@ function escapeHtml(s) {
 
 function renderHtml(pous, filePath) {
 	const sections = pous
-		.map((p) => {
-			const warn = p.truncated
-				? `<div class="tag">trailing cross-reference trimmed</div>`
-				: "";
+		.map((p, i) => {
+			const tags = [
+				p.truncated ? `<div class="tag">trailing cross-reference trimmed</div>` : "",
+				!p.editable ? `<div class="tag warn">read-only</div>` : "",
+			].join("");
+			const body = p.editable
+				? `<textarea data-idx="${i}" spellcheck="false">${escapeHtml(p.text)}</textarea>
+					<button data-idx="${i}" class="save">Save</button>
+					<span class="status" data-idx="${i}"></span>`
+				: `<pre>${escapeHtml(p.text)}</pre>`;
 			return `
-			<details>
-				<summary>${escapeHtml(p.name)} <span class="meta">${p.text.length} chars</span> ${warn}</summary>
-				<pre>${escapeHtml(p.text)}</pre>
+			<details ${p.editable ? "open" : ""}>
+				<summary>${escapeHtml(p.name)} <span class="meta">${p.text.length} chars</span> ${tags}</summary>
+				${body}
 			</details>`;
 		})
 		.join("\n");
@@ -27,13 +33,37 @@ function renderHtml(pous, filePath) {
 	summary { cursor: pointer; font-weight: 600; padding: 6px 0; }
 	.meta { font-weight: 400; opacity: .6; font-size: 11px; margin-left: 6px; }
 	.tag { display: inline-block; font-size: 10px; opacity: .7; border: 1px solid var(--vscode-editorWarning-foreground); border-radius: 3px; padding: 0 4px; margin-left: 6px; }
-	pre { white-space: pre-wrap; background: var(--vscode-textCodeBlock-background); padding: 10px; border-radius: 4px; }
+	.tag.warn { opacity: 1; }
+	pre, textarea { white-space: pre-wrap; background: var(--vscode-textCodeBlock-background); padding: 10px; border-radius: 4px; }
+	textarea { display: block; width: 100%; min-height: 300px; box-sizing: border-box; color: inherit; font-family: inherit; font-size: inherit; border: 1px solid var(--vscode-input-border, transparent); resize: vertical; }
+	button.save { margin-top: 6px; }
+	.status { margin-left: 8px; font-size: 12px; }
+	.status.ok { color: var(--vscode-testing-iconPassed, green); }
+	.status.err { color: var(--vscode-editorError-foreground, red); }
 	.banner { color: var(--vscode-editorWarning-foreground); font-size: 12px; margin-bottom: 12px; }
 </style>
 </head>
 <body>
-	<div class="banner">Read-only decoded view of ${escapeHtml(filePath)}. Edits made here are not written back to the .pro file.</div>
+	<div class="banner">Decoded view of ${escapeHtml(filePath)}. Only Structured Text POUs are editable - see the extension README. Ladder Diagram POUs are always read-only.</div>
 	${sections}
+	<script>
+		const vscode = acquireVsCodeApi();
+		document.querySelectorAll("button.save").forEach((btn) => {
+			btn.addEventListener("click", () => {
+				const idx = Number(btn.dataset.idx);
+				const text = document.querySelector(\`textarea[data-idx="\${idx}"]\`).value;
+				vscode.postMessage({ type: "save", idx, text });
+			});
+		});
+		window.addEventListener("message", (event) => {
+			const msg = event.data;
+			if (msg.type === "saveResult") {
+				const el = document.querySelector(\`.status[data-idx="\${msg.idx}"]\`);
+				el.textContent = msg.ok ? "Saved" : msg.error;
+				el.className = "status " + (msg.ok ? "ok" : "err");
+			}
+		});
+	</script>
 </body>
 </html>`;
 }
@@ -44,10 +74,45 @@ function activate(context) {
 			return { uri, dispose() {} };
 		},
 		async resolveCustomEditor(document, webviewPanel) {
-			webviewPanel.webview.options = { enableScripts: false };
+			webviewPanel.webview.options = { enableScripts: true };
 			const bytes = await vscode.workspace.fs.readFile(document.uri);
-			const pous = decodePro(Buffer.from(bytes));
+			let pous = decodePro(Buffer.from(bytes));
 			webviewPanel.webview.html = renderHtml(pous, document.uri.fsPath);
+
+			webviewPanel.webview.onDidReceiveMessage(async (msg) => {
+				if (msg.type !== "save") return;
+				const pou = pous[msg.idx];
+				try {
+					const syntax = checkStSyntax(msg.text);
+					if (!syntax.ok) {
+						throw new Error(`Syntax check failed - refusing to write. No changes were saved. ${syntax.error}`);
+					}
+
+					const currentBytes = await vscode.workspace.fs.readFile(document.uri);
+					const currentBuf = Buffer.from(currentBytes);
+					const newBuf = applyPouEdit(currentBuf, pou, msg.text);
+
+					// Round-trip safety net: re-decode what we're about to write and
+					// confirm the edited POU comes back out exactly as submitted, AND
+					// that every other POU's decoded text is untouched (this format
+					// may allow the file to grow/shrink - see decoder.js - so a bad
+					// splice could in principle bleed into a neighboring POU).
+					const verify = decodePro(newBuf);
+					const verifyPou = verify.find((p) => p.name === pou.name);
+					if (!verifyPou || verifyPou.text !== msg.text) {
+						throw new Error("Round-trip verification failed - refusing to write. No changes were saved.");
+					}
+					if (verify.length !== pous.length || pous.some((p, i) => p !== pou && p.text !== verify[i].text)) {
+						throw new Error("Round-trip verification failed: another POU's decoded text changed - refusing to write. No changes were saved.");
+					}
+
+					await vscode.workspace.fs.writeFile(document.uri, newBuf);
+					pous = verify;
+					webviewPanel.webview.postMessage({ type: "saveResult", idx: msg.idx, ok: true });
+				} catch (err) {
+					webviewPanel.webview.postMessage({ type: "saveResult", idx: msg.idx, ok: false, error: String(err.message || err) });
+				}
+			});
 		},
 	};
 
