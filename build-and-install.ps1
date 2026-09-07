@@ -6,17 +6,17 @@ $ErrorActionPreference = 'Stop'
 
 function Write-Info {
     param([string]$Message)
-    Write-Host "➜ $Message" -ForegroundColor Cyan
+    Write-Host "[*] $Message" -ForegroundColor Cyan
 }
 
 function Write-Success {
     param([string]$Message)
-    Write-Host "✓ $Message" -ForegroundColor Green
+    Write-Host "[+] $Message" -ForegroundColor Green
 }
 
-function Write-Error {
+function Write-ErrorMsg {
     param([string]$Message)
-    Write-Host "✗ $Message" -ForegroundColor Red
+    Write-Host "[-] $Message" -ForegroundColor Red
     exit 1
 }
 
@@ -27,7 +27,8 @@ try {
     Write-Info "Working directory: $ExtensionDir"
 
     if ($DryRun) {
-        Write-Host "`n[DRY RUN] Would execute:" -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "[DRY RUN] Would execute:" -ForegroundColor Yellow
         Write-Host "  cd '$ExtensionDir'"
         Write-Host "  npx vsce package"
         $VsixPath = Join-Path $ExtensionDir "codesys-v2-text-editor-0.0.1.vsix"
@@ -44,7 +45,7 @@ try {
     $VsixPath = Join-Path $ExtensionDir "codesys-v2-text-editor-0.0.1.vsix"
 
     if (-not (Test-Path $VsixPath)) {
-        Write-Error "VSIX file not found: $VsixPath"
+        Write-ErrorMsg "VSIX file not found: $VsixPath"
     }
 
     Write-Info "Installing extension into VS Code..."
@@ -55,5 +56,5 @@ try {
     Pop-Location
 }
 catch {
-    Write-Error $_.Exception.Message
+    Write-ErrorMsg $_.Exception.Message
 }
