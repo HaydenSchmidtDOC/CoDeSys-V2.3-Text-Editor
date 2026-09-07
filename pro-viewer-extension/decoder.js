@@ -55,10 +55,20 @@ const KNOWN_LD_POUS = new Set([
 // guessing - see decodeLadderBody's treeOk flag.
 const LD_CONTACT_BASE_TAG = 0x0b;
 const LD_CONTACT_NEGATED_BIT = 0x80;
+// Output coil tags. The `mode` is the ladder coil type, using the IEC 61131-3
+// names (the coil type is the meaningful flag for a text editor, not the
+// boolean value it drives):
+//   DIRECT = direct coil ( )  - coil follows the rung condition (TRUE)
+//   SET    = set coil (S)     - coil latches TRUE when rung is true
+//   RESET  = reset coil (R)   - coil latches FALSE when rung is true
+// The 0x03 tag (NEGATIV/SET) is the reset coil - it was previously mislabeled
+// "SET", which rendered `:= NOT TRUE; // SET` instead of the correct
+// `:= FALSE; // RESET`. Confirmed against the real ladder view: networks
+// 13/14/16/17 are (R) reset, 8/9 are (S) set, 4/5/6 are ( ) direct.
 const LD_OUTPUT_TAGS = {
-	0x00: { polarity: "POSITIV", mode: "NO_SET" },
+	0x00: { polarity: "POSITIV", mode: "DIRECT" },
 	0x02: { polarity: "POSITIV", mode: "SET" },
-	0x03: { polarity: "NEGATIV", mode: "SET" },
+	0x03: { polarity: "NEGATIV", mode: "RESET" },
 };
 const LD_TIMELIT_TAG = 0x41;
 // FB type name (e.g. "TON", "R_TRIG") when the instance has no PT/time-literal
@@ -85,41 +95,62 @@ function renderLeaf(node) {
 const LD_FB_EDGE_TYPES = new Set(["R_TRIG", "F_TRIG"]);
 
 /**
- * Walks a trusted AND/OR tree (see decodeLadderBody) computing, for every
- * FB-instance leaf, the boolean expression actually wired to its input pin
- * (`leaf.inExpr`) - i.e. the ladder rail's accumulated power at that exact
- * position: the AND of every element preceding it in the same AND-chain,
- * unaffected by sibling branches of an enclosing OR (a parallel split feeds
- * the same incoming power to every branch, not an accumulation across them).
- * Mirrors how the real project's ST source wires these same FB types
- * (SecurityDoor: "OpenTriggerFilter(IN:=OpenDoor, PT:=t#100ms);"). Returns the
- * node's own rendered contribution to its parent's expression - for a plain
- * contact that's its name; for an FB leaf it's `<name>.Q`, the FB's output
- * pin, since that (not the call itself) is what continues the rail forward -
- * confirmed against the real project's own convention for chaining FB
- * outputs, e.g. "UpperPEEdge(CLK:=OpenPEFilter.Q)".
+ * Renders a trusted AND/OR tree (see decodeLadderBody) as a single boolean
+ * expression, emitting each FB-instance leaf as an inline one-line call
+ * (`RunToRearTimer(IN:=BRRunToPE, PT:=T#6000ms)`) whose `IN`/`CLK` is wired
+ * from the *immediately preceding* element in the same branch - NOT the whole
+ * accumulated chain. The FB's `.Q` output then continues the rail, exactly
+ * like the real project's own ST convention (SecurityDoor:
+ * "OpenTriggerFilter(IN:=OpenDoor, PT:=t#100ms);"). Returns the rendered
+ * expression string; the caller emits the FB calls as their own statements
+ * before the IF that references the `.Q` outputs.
  */
-function assignFbWiring(node, incoming) {
+function renderTree(node) {
 	if (!("children" in node)) {
-		if (node.fb) {
-			node.inExpr = incoming;
-			return `${node.name}.Q`;
-		}
+		if (node.fb) return `${node.name}.Q`;
 		return node.negated ? `NOT ${node.name}` : node.name;
 	}
+	// A single-child group is a redundant wrapper (the parser nests
+	// AND[ AND[ ... ] ] around chains) - unwrap it so the FB-collapse below
+	// can see through to the real chain.
+	if (node.children.length === 1) return renderTree(node.children[0]);
+	if (node.type === "AND") {
+		// An FB leaf consumes the siblings before it in the same AND chain
+		// (they're its IN wiring, already emitted in the FB call statement).
+		// So the FB's .Q replaces that whole feeding chain - the condition
+		// references only the .Q, not the duplicated input. Mirrors the real
+		// project's ST convention (OpenTriggerFilter(IN:=OpenDoor, PT:=t#100ms);
+		// then IF OpenTriggerFilter.Q THEN). The collapse must recurse through
+		// nested single-child ANDs (the parser often wraps a chain in
+		// AND[ AND[ ... ] ]), so find the deepest FB in the AND spine.
+		let lastFbIdx = -1;
+		for (let i = 0; i < node.children.length; i++) {
+			const child = node.children[i];
+			if (!("children" in child) && child.fb) lastFbIdx = i;
+		}
+		if (lastFbIdx >= 0) {
+			const parts = [];
+			for (let i = lastFbIdx; i < node.children.length; i++) {
+				parts.push(renderTree(node.children[i]));
+			}
+			return parts.length <= 1 ? parts[0] : parts.join(" AND ");
+		}
+	}
 	const parts = [];
-	let acc = incoming;
 	for (const child of node.children) {
-		const childStr = assignFbWiring(child, node.type === "AND" ? acc : incoming);
+		const childStr = renderTree(child);
 		const wrapped = "children" in child && child.children.length > 1 ? `(${childStr})` : childStr;
 		parts.push(wrapped);
-		if (node.type === "AND") acc = acc === "TRUE" ? wrapped : `${acc} AND ${wrapped}`;
 	}
 	return parts.length <= 1 ? parts[0] || "" : parts.join(node.type === "AND" ? " AND " : " OR ");
 }
 
-/** Renders an FB-instance leaf as a standalone call statement, ST-style,
- * using the `inExpr` wiring computed by assignFbWiring. */
+/**
+ * Renders an FB-instance leaf as a standalone one-line call statement,
+ * ST-style, wired from the immediately preceding element in its branch.
+ * `inExpr` is the boolean expression of the element(s) directly before the FB
+ * in the same AND-chain (or "TRUE" if none) - the rail's power at that point.
+ */
 function renderFbCall(leaf) {
 	const pin = LD_FB_EDGE_TYPES.has(leaf.fbType) ? "CLK" : "IN";
 	const args = [`${pin}:=${leaf.inExpr}`];
@@ -362,6 +393,38 @@ function decodeLadderBody(buf, startOffset, endOffset) {
 	return networks;
 }
 
+/**
+ * Walks a trusted AND/OR tree (see decodeLadderBody) computing, for every
+ * FB-instance leaf, the boolean expression actually wired to its input pin
+ * (`leaf.inExpr`) - i.e. the ladder rail's accumulated power at that exact
+ * position: the AND of every element preceding it in the same AND-chain,
+ * unaffected by sibling branches of an enclosing OR (a parallel split feeds
+ * the same incoming power to every branch, not an accumulation across them).
+ * Mirrors how the real project's ST source wires these same FB types
+ * (SecurityDoor: "OpenTriggerFilter(IN:=OpenDoor, PT:=t#100ms);"). Returns the
+ * node's own rendered contribution to its parent's expression - for a plain
+ * contact that's its name; for an FB leaf it's `<name>.Q`, the FB's output
+ * pin, since that (not the call itself) is what continues the rail forward.
+ */
+function assignFbWiring(node, incoming) {
+	if (!("children" in node)) {
+		if (node.fb) {
+			node.inExpr = incoming;
+			return `${node.name}.Q`;
+		}
+		return node.negated ? `NOT ${node.name}` : node.name;
+	}
+	const parts = [];
+	let acc = incoming;
+	for (const child of node.children) {
+		const childStr = assignFbWiring(child, node.type === "AND" ? acc : incoming);
+		const wrapped = "children" in child && child.children.length > 1 ? `(${childStr})` : childStr;
+		parts.push(wrapped);
+		if (node.type === "AND") acc = acc === "TRUE" ? wrapped : `${acc} AND ${wrapped}`;
+	}
+	return parts.length <= 1 ? parts[0] || "" : parts.join(node.type === "AND" ? " AND " : " OR ");
+}
+
 /** Renders decoded networks as a readable, clearly-labeled best-effort text block. */
 function renderLadderNetworks(networks) {
 	if (!networks.length) return "";
@@ -378,10 +441,16 @@ function renderLadderNetworks(networks) {
 		if (!net.elements.length) {
 			condStr = "(no contacts decoded)";
 		} else if (net.treeOk) {
-			condStr = assignFbWiring(net.tree, "TRUE");
-			// Emit each FB instance as its own labeled call statement (IN/CLK + PT
-			// wiring, ST-style - matches how the real project's own ST source calls
-			// these same FB types), in rung order, before the IF that uses their .Q.
+			// First walk the tree to compute each FB leaf's IN wiring (the
+			// accumulated rail power at its position), then render the clean
+			// condition (FB .Q outputs only, no duplicated input chain).
+			assignFbWiring(net.tree, "TRUE");
+			condStr = renderTree(net.tree);
+			// Emit each FB instance as its own one-line call statement (IN/CLK +
+			// PT wiring, ST-style - matches how the real project's own ST source
+			// calls these same FB types), in rung order, before the IF that uses
+			// their .Q. Each FB's IN is the accumulated rail power at its exact
+			// position (the AND of everything preceding it in the same branch).
 			fbCalls = net.elements.filter((el) => el.fb).map(renderFbCall);
 		} else {
 			condStr = net.elements.map(renderLeaf).join(" <AND/OR: MIXED, unresolved> ");
@@ -391,8 +460,11 @@ function renderLadderNetworks(networks) {
 		lines.push(`  IF ${condStr} THEN`);
 		if (net.outputs.length) {
 			for (const out of net.outputs) {
-				const neg = out.polarity === "NEGATIV" ? "NOT " : "";
-				lines.push(`    ${out.name} := ${neg}TRUE; // ${out.mode}`);
+				// The coil type (DIRECT/SET/RESET) IS the operation - the boolean
+				// value it drives is fully determined by it (DIRECT/SET -> TRUE,
+				// RESET -> FALSE), so emitting both would be redundant and
+				// contradictory (e.g. "TRUE; // RESET" is nonsense).
+				lines.push(`    ${out.name} := ${out.mode};`);
 			}
 		} else {
 			lines.push("    (no output decoded)");
@@ -429,8 +501,7 @@ function findPrintableRuns(buf) {
 }
 
 /** Finds runs that begin (after stripping leading whitespace) with a POU keyword. */
-function findPouStarts(buf) {
-	const runs = findPrintableRuns(buf);
+function findPouStarts(buf, runs) {
 	const hits = [];
 	for (const [start, length] of runs) {
 		let s = start;
@@ -442,6 +513,69 @@ function findPouStarts(buf) {
 		}
 	}
 	return hits;
+}
+
+/**
+ * Finds the implementation-body run that follows a POU's header+declaration
+ * run. In this format an ST POU's source is split across two printable runs:
+ * the header+VAR block, then a short non-printable gap containing the 0x12
+ * separator byte, then a 16-bit little-endian length, then the implementation
+ * body (exactly `len` bytes). `start` is the end of the header run (the first
+ * non-printable byte after it); `limit` is the next POU's start (or end of
+ * file). Returns { start, end } of the implementation body, or null if no
+ * valid 0x12 + length-prefixed body is found before `limit`.
+ */
+function findImplementationRun(buf, start, limit) {
+	// Scan the gap after the header run for the 0x12 separator byte.
+	let sep = -1;
+	for (let i = start; i < Math.min(start + 64, limit); i++) {
+		if (buf[i] === 0x12) { sep = i; break; }
+	}
+	if (sep === -1) return null;
+	// 16-bit little-endian length at sep+1..sep+2, then 2 zero bytes, then the
+	// body. Verified across all 13 ST POUs in the corpus (single-byte lengths
+	// like UPS's 187 and multi-byte like MAIN's 3072 both decode correctly).
+	const len = buf[sep + 1] + (buf[sep + 2] << 8);
+	const implStart = sep + 5;
+	const implEnd = implStart + len;
+	if (len <= 0 || implEnd > limit) return null;
+	// Sanity: the body must be printable text (it's ST source).
+	for (let i = implStart; i < implEnd; i++) {
+		if (!isPrintable(buf[i])) return null;
+	}
+	return { start: implStart, end: implEnd };
+}
+
+/**
+ * Format-based ladder detection: a real LD POU's binary body is marked by the
+ * confirmed `08 FF` network-boundary byte pair (see decodeLadderBody). That is
+ * a specific, positive structural signature - plain Structured Text (even
+ * "poor" ST with dropped framing bytes or interleaved junk) does not contain
+ * the `08 FF` pair, because 0x08 and 0xFF are non-printable and never appear
+ * inside a text run. So: if the post-END_VAR region contains at least one
+ * `08 FF` pair, treat the POU as ladder and keep it read-only. This is
+ * deliberately conservative - an unlisted ladder POU with no marker would be
+ * left editable (and can be added to KNOWN_LD_POUS), but a real ST POU is
+ * never wrongly locked as read-only.
+ */
+function looksLikeLadderBody(buf, start, end) {
+	let pos = start;
+	for (;;) {
+		const idx = buf.indexOf("END_VAR", pos, "latin1");
+		if (idx === -1 || idx >= end) break;
+		const after = idx + "END_VAR".length;
+		const tail = buf.toString("latin1", after, Math.min(after + 16, end)).replace(/^[\r\n]+/, "");
+		if (tail.startsWith("VAR")) {
+			pos = after;
+			continue;
+		}
+		pos = after;
+		break;
+	}
+	for (let i = pos; i + 1 < end; i++) {
+		if (buf[i] === 0x08 && buf[i + 1] === 0xff) return true;
+	}
+	return false;
 }
 
 /** Like the old cleanRange, but also returns the exact source offset of every
@@ -466,13 +600,45 @@ function cleanRangeWithPositions(buf, start, end) {
  * when `editable` is true (see applyPouEdit).
  */
 function decodePro(buf) {
-	const starts = findPouStarts(buf);
+	const runs = findPrintableRuns(buf);
+	const starts = findPouStarts(buf, runs);
 	const results = [];
 
 	for (let idx = 0; idx < starts.length; idx++) {
 		const start = starts[idx];
-		const end = idx + 1 < starts.length ? starts[idx + 1] : Math.min(start + 4000, buf.length);
-		let { text, positions } = cleanRangeWithPositions(buf, start, end);
+		// The POU's text is the printable run that begins at `start`. Its true
+		// end is where that run ends (the next non-printable framing byte) -
+		// NOT the next POU's start, which can sweep the next POU's header (and
+		// any forward-link) into this POU's text (the UPS/TwinSafe leak). The
+		// next POU's start is only a hard safety cap in case a run is malformed.
+		const run = runs.find(([rs]) => rs === start);
+		const runEnd = run ? run[0] + run[1] : buf.length;
+		const nextStart = idx + 1 < starts.length ? starts[idx + 1] : buf.length;
+		// `textEnd` bounds the ST text: the printable run's own end (the next
+		// non-printable framing byte), capped at the next POU's start. This is
+		// what stops the next POU's header from leaking into this POU's text.
+		const textEnd = Math.min(runEnd, nextStart);
+		// `scanEnd` bounds the ladder body scan: a ladder POU's binary body
+		// lives OUTSIDE its printable run (it's non-printable), so it must be
+		// scanned up to the next POU's start (or a generous window for the last
+		// POU), not just to the run end.
+		const scanEnd = nextStart !== buf.length ? nextStart : Math.min(runEnd + 20000, buf.length);
+		let { text, positions } = cleanRangeWithPositions(buf, start, textEnd);
+
+		// A POU's ST source is stored as TWO printable runs: the header +
+		// declarations (this run), then a short non-printable gap containing the
+		// 0x12 separator byte, then the implementation body (a second run). The
+		// run-based boundary above correctly stops at the first run's end, but
+		// that would drop the implementation. So: after the header run, look for
+		// the 0x12 separator and append the following implementation run. This
+		// is what recovers the full ST body (e.g. UPS_CX80xx's FB call) without
+		// sweeping in the Visualization data that follows the implementation.
+		const impl = findImplementationRun(buf, textEnd, nextStart);
+		if (impl) {
+			const implClean = cleanRangeWithPositions(buf, impl.start, impl.end);
+			text += "\r\n" + implClean.text;
+			positions = positions.concat([null, null], implClean.positions);
+		}
 
 		// A single stray non-printable framing byte is sometimes dropped between
 		// the declaration's END_VAR and whatever immediately follows it in the
@@ -496,36 +662,12 @@ function decodePro(buf) {
 			positions = newPositions;
 		}
 
-		// Name of this POU, read off its own header line.
-		const headerMatch = text.match(/^(PROGRAM|FUNCTION_BLOCK|FUNCTION)\s+([A-Za-z0-9_]+)/);
+		// Name of this POU, read off its own header line. The run may begin
+		// with leading CRLF (the printable run starts at the first printable
+		// byte, which can be a newline before the PROGRAM keyword), so strip
+		// leading whitespace before matching.
+		const headerMatch = text.match(/^\s*(PROGRAM|FUNCTION_BLOCK|FUNCTION)\s+([A-Za-z0-9_]+)/);
 		const name = headerMatch ? headerMatch[2] : `Unknown_${start}`;
-
-		// Trailing bytes often carry the *next* POU's name (an internal database
-		// forward-link) swept up by our scan. Only trim it if it's clearly marked
-		// off by a comma shortly beforehand, to avoid cutting real code that
-		// legitimately references another POU's name.
-		let truncated = false;
-		if (idx + 1 < starts.length) {
-			const nextHeader = buf.toString("latin1", starts[idx + 1], starts[idx + 1] + 60);
-			const nextNameMatch = nextHeader.match(/^(PROGRAM|FUNCTION_BLOCK|FUNCTION)\s+([A-Za-z0-9_]+)/);
-			const nextName = nextNameMatch ? nextNameMatch[2] : null;
-			if (nextName) {
-				const tailStart = Math.max(0, text.length - 400);
-				const commaIdx = text.lastIndexOf("," + nextName);
-				if (commaIdx >= tailStart) {
-					const head = text.slice(0, commaIdx);
-					const terminatorRe = /(END_IF|END_CASE|END_WHILE|END_FOR|END_REPEAT|;)\s*/g;
-					let m, last = null;
-					while ((m = terminatorRe.exec(head)) !== null) last = m;
-					text = last ? head.slice(0, last.index + last[0].length) : head;
-					truncated = true;
-					// This trim only shortens text from the end (a prefix slice), so
-					// positions[i] still maps to text[i] for every surviving
-					// character - keep it editable.
-					if (editable) positions = positions.slice(0, text.length);
-				}
-			}
-		}
 
 		// Trim leading/trailing whitespace, keeping `positions` in lockstep so
 		// positions[i] still maps to text[i] for the surviving editable case.
@@ -534,17 +676,21 @@ function decodePro(buf) {
 		if (editable) positions = positions.slice(trimmedStart, trimmedStart + trimmed.length);
 		text = trimmed;
 
-		if (KNOWN_LD_POUS.has(name)) {
+		// Read-only if the POU is a known ladder name OR its post-END_VAR body
+		// is majority binary (format-based detection - catches unlisted LD/FBD
+		// POUs that would otherwise be mis-decoded as editable ST).
+		const isLadder = KNOWN_LD_POUS.has(name) || looksLikeLadderBody(buf, start, scanEnd);
+		if (isLadder) {
 			editable = false;
 			try {
-				const networks = decodeLadderBody(buf, start, end);
+				const networks = decodeLadderBody(buf, start, scanEnd);
 				text += renderLadderNetworks(networks);
 			} catch (e) {
 				// Best-effort only - if the scan fails, keep just the declaration text.
 			}
 		}
 
-		results.push({ name, text, truncated, editable, positions: editable ? positions : null });
+		results.push({ name, text, truncated: false, editable, positions: editable ? positions : null });
 	}
 
 	return results;
@@ -613,34 +759,199 @@ const ST_BLOCK_PAIRS = [
 	[/\bREPEAT\b/gi, /\bEND_REPEAT\b/gi],
 ];
 
+// Keywords that open a block but have NO closer (they close implicitly at the
+// end of the enclosing block / POU). A stray one mid-implementation is a
+// likely syntax slip, so flag it.
+const ST_IMPLICIT_CLOSE = new Set(["ELSE", "ELSIF", "ELSEIF", "RETURN", "EXIT"]);
+
+// Keywords that must NOT appear inside a declaration block (VAR...END_VAR).
+const ST_DECL_ONLY = new Set(["VAR", "VAR_INPUT", "VAR_OUTPUT", "VAR_IN_OUT", "VAR_GLOBAL", "VAR_EXTERNAL", "VAR_STAT", "VAR_TEMP"]);
+
+// Keywords that must NOT appear inside an implementation block (they only
+// make sense in declarations).
+const ST_IMPL_ONLY = new Set(["IF", "CASE", "FOR", "WHILE", "REPEAT", "RETURN", "EXIT"]);
+
 /**
- * Lazy sanity check for edited Structured Text: not a real parser, just
- * confirms the block keywords and bracket/paren nesting this codebase
- * actually uses (see EXPORT.EXP keyword survey) are still balanced after an
- * edit. Catches the common slip (deleted an END_IF, mismatched parens) before
- * it's written to disk; does not catch every possible syntax error and is not
- * a substitute for a Rebuild in TwinCat. Returns { ok: true } or
- * { ok: false, error }.
+ * Tokenizes Structured Text into a stream of { type, value, line } tokens,
+ * stripping comments and string literals so keywords inside them don't count.
+ * Types: "word", "num", "str", "punct", "newline", "eof".
+ */
+function tokenizeSt(text) {
+	const tokens = [];
+	let i = 0, line = 1;
+	const n = text.length;
+	while (i < n) {
+		const c = text[i];
+		if (c === "\r" || c === "\n") {
+			if (c === "\n") line++;
+			i++;
+			tokens.push({ type: "newline", value: c, line });
+			continue;
+		}
+		if (c === " " || c === "\t") { i++; continue; }
+		// Comment: (* ... *) or // ... to end of line
+		if (c === "(" && text[i + 1] === "*") {
+			const end = text.indexOf("*)", i + 2);
+			if (end === -1) return { tokens, error: `Unterminated comment starting line ${line}.` };
+			line += (text.slice(i, end).match(/\n/g) || []).length;
+			i = end + 2;
+			continue;
+		}
+		if (c === "/" && text[i + 1] === "/") {
+			const nl = text.indexOf("\n", i);
+			i = nl === -1 ? n : nl;
+			continue;
+		}
+		// String literal: '...' (ST uses single quotes)
+		if (c === "'") {
+			let j = i + 1;
+			while (j < n && text[j] !== "'") {
+				if (text[j] === "\n") line++;
+				j++;
+			}
+			if (j >= n) return { tokens, error: `Unterminated string literal starting line ${line}.` };
+			tokens.push({ type: "str", value: text.slice(i, j + 1), line });
+			i = j + 1;
+			continue;
+		}
+		// Number (incl. time literals like T#6000ms, hex 16#FF)
+		if (/[0-9]/.test(c) || (c === "T" && text[i + 1] === "#") || (c === "1" && text[i + 1] === "6" && text[i + 2] === "#")) {
+			let j = i;
+			while (j < n && /[0-9A-Za-z_#.]/.test(text[j])) j++;
+			tokens.push({ type: "num", value: text.slice(i, j), line });
+			i = j;
+			continue;
+		}
+		// Word / identifier
+		if (/[A-Za-z_]/.test(c)) {
+			let j = i;
+			while (j < n && /[A-Za-z0-9_]/.test(text[j])) j++;
+			tokens.push({ type: "word", value: text.slice(i, j), line });
+			i = j;
+			continue;
+		}
+		// Punctuation / operators
+		if ("()[];:.,:=+-*/<>=&".includes(c)) {
+			// multi-char operators
+			const two = text.slice(i, i + 2);
+			if (two === ":=" || two === "<>" || two === "<=" || two === ">=" || two === "..") {
+				tokens.push({ type: "punct", value: two, line });
+				i += 2;
+				continue;
+			}
+			tokens.push({ type: "punct", value: c, line });
+			i++;
+			continue;
+		}
+		// Unknown char - skip but note it
+		tokens.push({ type: "punct", value: c, line });
+		i++;
+	}
+	tokens.push({ type: "eof", value: "", line });
+	return { tokens };
+}
+
+/**
+ * Real (if lightweight) Structured Text syntax check for edited POUs. Unlike
+ * the old keyword-counting check, this tokenizes the text (so keywords inside
+ * comments/strings don't count), tracks block nesting with a stack, and
+ * catches: unbalanced blocks, a block closed out of order, a stray ELSE/ELSIF
+ * outside an IF, a declaration keyword inside the implementation, an
+ * implementation keyword inside a declaration, and unbalanced parens/brackets.
+ * It is still not a full IEC 61131-3 parser (no type checking, no
+ * declaration-vs-use validation) and is not a substitute for a Rebuild in
+ * TwinCat. Returns { ok: true } or { ok: false, error }.
  */
 function checkStSyntax(text) {
-	for (const [openRe, closeRe] of ST_BLOCK_PAIRS) {
-		const opens = (text.match(openRe) || []).length;
-		const closes = (text.match(closeRe) || []).length;
-		if (opens !== closes) {
-			const keyword = closeRe.source.replace(/\\b/g, "");
-			return { ok: false, error: `Unbalanced ${keyword}: ${opens} opening keyword(s) vs ${closes} closer(s).` };
-		}
-	}
-	for (const [open, close, label] of [["(", ")", "parentheses"], ["[", "]", "brackets"]]) {
-		let depth = 0;
-		for (const ch of text) {
-			if (ch === open) depth++;
-			else if (ch === close) {
-				depth--;
-				if (depth < 0) return { ok: false, error: `Unbalanced ${label}: closed one that was never opened.` };
+	const { tokens, error } = tokenizeSt(text);
+	if (error) return { ok: false, error };
+
+	const stack = []; // { kind, line }
+	let inDecl = false; // inside a VAR...END_VAR block
+	let declDepth = 0;
+	let parenDepth = 0, bracketDepth = 0;
+	let lastSignificant = null; // last non-newline token, for statement-start detection
+
+	for (const tok of tokens) {
+		if (tok.type === "newline" || tok.type === "eof") continue;
+		const up = tok.value.toUpperCase();
+
+		if (tok.type === "punct") {
+			if (tok.value === "(") parenDepth++;
+			else if (tok.value === ")") {
+				parenDepth--;
+				if (parenDepth < 0) return { ok: false, error: `Unbalanced parentheses: closed one that was never opened (line ${tok.line}).` };
+			} else if (tok.value === "[") bracketDepth++;
+			else if (tok.value === "]") {
+				bracketDepth--;
+				if (bracketDepth < 0) return { ok: false, error: `Unbalanced brackets: closed one that was never opened (line ${tok.line}).` };
 			}
+			lastSignificant = tok;
+			continue;
 		}
-		if (depth !== 0) return { ok: false, error: `Unbalanced ${label}: ${depth} unclosed.` };
+		if (tok.type !== "word") { lastSignificant = tok; continue; }
+
+		// Declaration block tracking
+		if (ST_DECL_ONLY.has(up)) {
+			if (inDecl) return { ok: false, error: `Nested ${up} inside a declaration block (line ${tok.line}).` };
+			inDecl = true;
+			declDepth = 0;
+			stack.push({ kind: "VAR", line: tok.line });
+			lastSignificant = tok;
+			continue;
+		}
+		if (up === "END_VAR") {
+			if (!inDecl) return { ok: false, error: `END_VAR without a matching VAR (line ${tok.line}).` };
+			inDecl = false;
+			stack.pop();
+			lastSignificant = tok;
+			continue;
+		}
+
+		// Block openers / closers
+		const openers = { IF: "END_IF", CASE: "END_CASE", FOR: "END_FOR", WHILE: "END_WHILE", REPEAT: "END_REPEAT" };
+		const closers = { END_IF: "IF", END_CASE: "CASE", END_FOR: "FOR", END_WHILE: "WHILE", END_REPEAT: "REPEAT" };
+		if (openers[up]) {
+			if (inDecl) return { ok: false, error: `${up} inside a declaration block (line ${tok.line}).` };
+			stack.push({ kind: up, line: tok.line });
+			lastSignificant = tok;
+			continue;
+		}
+		if (closers[up]) {
+			if (inDecl) return { ok: false, error: `${up} inside a declaration block (line ${tok.line}).` };
+			const top = stack[stack.length - 1];
+			if (!top || top.kind !== closers[up]) {
+				return { ok: false, error: `${up} without a matching ${closers[up]} (line ${tok.line}).` };
+			}
+			stack.pop();
+			lastSignificant = tok;
+			continue;
+		}
+
+		// ELSE / ELSIF must be inside an IF
+		if (up === "ELSE" || up === "ELSIF" || up === "ELSEIF") {
+			if (inDecl) return { ok: false, error: `${up} inside a declaration block (line ${tok.line}).` };
+			if (!stack.some((s) => s.kind === "IF")) {
+				return { ok: false, error: `${up} outside an IF block (line ${tok.line}).` };
+			}
+			lastSignificant = tok;
+			continue;
+		}
+
+		// Implementation-only keywords must not be in declarations
+		if (inDecl && ST_IMPL_ONLY.has(up)) {
+			return { ok: false, error: `${up} inside a declaration block (line ${tok.line}).` };
+		}
+
+		lastSignificant = tok;
+	}
+
+	if (inDecl) return { ok: false, error: "Unterminated declaration block: missing END_VAR." };
+	if (parenDepth !== 0) return { ok: false, error: `Unbalanced parentheses: ${parenDepth} unclosed.` };
+	if (bracketDepth !== 0) return { ok: false, error: `Unbalanced brackets: ${bracketDepth} unclosed.` };
+	if (stack.length) {
+		const top = stack[stack.length - 1];
+		return { ok: false, error: `Unclosed ${top.kind} block (opened line ${top.line}).` };
 	}
 	return { ok: true };
 }

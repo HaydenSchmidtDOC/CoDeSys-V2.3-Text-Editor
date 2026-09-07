@@ -56,7 +56,7 @@ assert.throws(() => applyPouEdit(buf, pous[1], pous[1].text), /not editable/);
 // body (synthetic CONTACT "Foo" + OUTPUT "Bar" bytes from buildFakePro).
 assert.ok(pous[1].text.includes("NETWORK 1:"), "expected a decoded NETWORK line");
 assert.ok(pous[1].text.includes("Foo"), "expected decoded contact name Foo");
-assert.ok(pous[1].text.includes("Bar := TRUE"), "expected decoded output Bar := TRUE");
+assert.ok(pous[1].text.includes("Bar := SET;"), "expected decoded output Bar := SET");
 
 // 6. Network-boundary regression check: real HybridControl data showed the
 // "08 FF" network marker separated from the next record's tag byte by 0-3
@@ -131,8 +131,8 @@ const timerNets = decodeLadderBody(Buffer.concat([Buffer.from("PROGRAM X\r\nVAR\
 assert.strictEqual(timerNets[0].treeOk, true, "timer rung must produce a fully-balanced tree");
 const timerRendered = renderLadderNetworks(timerNets);
 assert.ok(timerRendered.includes("RunToRearTimer(IN:=BRRunToPE, PT:=T#6000ms);"), "expected a labeled ST-style FB call statement, IN wired from the preceding contact");
-assert.ok(timerRendered.includes("IF (BRRunToPE AND RunToRearTimer.Q) THEN"), "expected the condition to reference the FB's .Q output");
-assert.ok(timerRendered.includes("BRRunToPE := NOT TRUE; // SET"), "expected the network's NEGATIV/SET output coil");
+assert.ok(timerRendered.includes("IF RunToRearTimer.Q THEN"), "expected the condition to reference only the FB's .Q output (not the whole preceding chain)");
+assert.ok(timerRendered.includes("BRRunToPE := RESET;"), "expected the network's NEGATIV/SET (reset) output coil");
 
 // 7e. Cascaded timers with a nested group right after a non-terminal FB's own
 // trailing bytes (PT + type name + 8-byte trailer) must not be misread as
@@ -159,13 +159,13 @@ const cascadeNets = decodeLadderBody(Buffer.concat([Buffer.from("PROGRAM X\r\nVA
 assert.strictEqual(cascadeNets[0].treeOk, true, "cascaded-timer rung must produce a fully-balanced tree");
 const cascadeRendered = renderLadderNetworks(cascadeNets);
 assert.ok(
-	cascadeRendered.includes("IF (BRRunRel AND (RunRelJamTimer.Q OR (InductPE1 AND RunToReleaseTimer.Q))) THEN"),
+	cascadeRendered.includes("IF BRRunRel AND (RunRelJamTimer.Q OR (RunToReleaseTimer.Q)) THEN"),
 	"expected the nested OR(FB, AND(contact, FB)) tree, not a flattened 3-way OR"
 );
-// Each FB's IN is the rail's accumulated power at its exact position: the
-// first (non-terminal, OR-branch) timer sees just the AND-chain before the
-// OR split; the second (terminal, nested inside the AND branch) additionally
-// sees the contact preceding it within that branch.
+// Each FB's IN is the accumulated rail power at its exact position: the first
+// (non-terminal, OR-branch) timer sees just the AND-chain before the OR split
+// (BRRunRel); the second (terminal, nested inside the AND branch) additionally
+// sees the contact preceding it within that branch (BRRunRel AND InductPE1).
 assert.ok(cascadeRendered.includes("RunRelJamTimer(IN:=BRRunRel, PT:=T#4000ms);"), "expected first timer's IN wired from the preceding contact only");
 assert.ok(
 	cascadeRendered.includes("RunToReleaseTimer(IN:=BRRunRel AND InductPE1, PT:=T#1000ms);"),
@@ -176,5 +176,101 @@ assert.ok(
 assert.strictEqual(checkStSyntax("IF X THEN\r\nY := (A + B);\r\nEND_IF\r\n").ok, true);
 assert.strictEqual(checkStSyntax("IF X THEN\r\nY := TRUE;\r\n").ok, false, "missing END_IF must fail");
 assert.strictEqual(checkStSyntax("Y := (A + B;\r\n").ok, false, "unbalanced paren must fail");
+
+// 8b. Syntax checker must ignore keywords inside comments and strings.
+assert.strictEqual(
+	checkStSyntax("(* IF X THEN *) \r\nY := 'END_IF';\r\n").ok,
+	true,
+	"keywords inside comments/strings must not count"
+);
+
+// 8c. Syntax checker must catch a stray ELSE outside an IF, and a block closed
+// out of order.
+assert.strictEqual(checkStSyntax("ELSE\r\nY := TRUE;\r\n").ok, false, "stray ELSE outside IF must fail");
+assert.strictEqual(
+	checkStSyntax("IF X THEN\r\nCASE Y OF\r\nEND_IF\r\nEND_CASE\r\n").ok,
+	false,
+	"out-of-order block close must fail"
+);
+
+// 8d. Syntax checker must catch a declaration keyword inside the implementation
+// and an implementation keyword inside a declaration.
+assert.strictEqual(
+	checkStSyntax("VAR\r\nX: BOOL;\r\nVAR Y: INT;\r\nEND_VAR\r\n").ok,
+	false,
+	"nested VAR inside declaration must fail"
+);
+assert.strictEqual(
+	checkStSyntax("VAR\r\nIF X: BOOL;\r\nEND_VAR\r\n").ok,
+	false,
+	"IF inside declaration must fail"
+);
+
+// 9. POU boundary: a POU's text must end at its own printable run, NOT sweep
+// the next POU's header. Build two POUs separated by a non-printable framing
+// byte (no comma before the next name - the old heuristic would have leaked).
+const pouA2 = Buffer.from("PROGRAM Foo\r\nVAR\r\n\tX: BOOL;\r\nEND_VAR\r\nX := TRUE;\r\n", "latin1");
+const pouB2 = Buffer.from("PROGRAM Bar\r\nVAR\r\nEND_VAR\r\nY := FALSE;\r\n", "latin1");
+const framed = Buffer.concat([pouA2, Buffer.from([0x00]), pouB2]);
+const framedPous = decodePro(framed);
+assert.strictEqual(framedPous.length, 2, "expected 2 POUs");
+assert.ok(!framedPous[0].text.includes("PROGRAM Bar"), "POU Foo must not leak Bar's header");
+assert.ok(framedPous[0].text.includes("X := TRUE;"), "POU Foo must keep its own tail");
+assert.ok(framedPous[1].text.includes("Y := FALSE;"), "POU Bar must decode fully");
+
+// 10. Format-based LD detection: an UNLISTED ladder POU (binary post-END_VAR
+// body with an 08 FF network marker, not in KNOWN_LD_POUS) must be forced
+// read-only, not treated as editable ST.
+const unlistedLd = Buffer.concat([
+	Buffer.from("PROGRAM MysteryLadder\r\nVAR\r\nEND_VAR", "latin1"),
+	Buffer.from([0x08, 0xff, 0x09, 0x0b, 0x03, 0x46, 0x6f, 0x6f, 0x00, 0x00, 0x00, 0x02, 0x03, 0x42, 0x61, 0x72, 0x00, 0x00]), // ladder body with 08 FF marker
+]);
+const unlistedPous = decodePro(unlistedLd);
+assert.strictEqual(unlistedPous[0].editable, false, "unlisted ladder POU must be read-only");
+assert.ok(unlistedPous[0].text.includes("NETWORK 1:"), "unlisted ladder POU must still decode its networks");
+
+// 10b. A normal ST POU (printable post-END_VAR body) must stay editable even
+// if its name is NOT in KNOWN_LD_POUS.
+const plainSt = Buffer.from("PROGRAM PlainSt\r\nVAR\r\n\tX: BOOL;\r\nEND_VAR\r\nX := TRUE;\r\n", "latin1");
+const plainPous = decodePro(plainSt);
+assert.strictEqual(plainPous[0].editable, true, "plain ST POU must stay editable");
+
+// 10c. "Poor" Structured Text - ST with dropped framing bytes / interleaved
+// non-printable junk in its implementation (the UPS case) - must NOT be
+// mis-detected as ladder. It has no 08 FF marker, so it stays editable.
+const poorSt = Buffer.concat([
+	Buffer.from("PROGRAM Ups\r\nVAR\r\n\tX: BOOL;\r\nEND_VAR", "latin1"),
+	Buffer.from([0x00]), // dropped framing byte
+	Buffer.from("X := TRUE;\r\n", "latin1"),
+	Buffer.from([0x00, 0x01]), // interleaved junk
+	Buffer.from("Y := FALSE;\r\n", "latin1"),
+]);
+const poorStPous = decodePro(poorSt);
+assert.strictEqual(poorStPous[0].editable, true, "poor ST (no 08 FF marker) must stay editable");
+
+// 11. Two-run ST structure: a POU's implementation body is a SECOND printable
+// run after the header+VAR run, separated by 0x12 + 16-bit LE length + 2 zero
+// bytes. The decoder must join them (recovering the full body) without
+// sweeping in the Visualization data that follows.
+const twoRunBody = "X := TRUE;\r\nY := FALSE;\r\n"; // 25 bytes
+const twoRunSt = Buffer.concat([
+	Buffer.from("PROGRAM Ups\r\nVAR\r\n\tX: BOOL;\r\nEND_VAR", "latin1"),
+	Buffer.from([0x12, twoRunBody.length & 0xff, (twoRunBody.length >> 8) & 0xff, 0x00, 0x00]), // 0x12 + len (LE) + 2 zero bytes
+	Buffer.from(twoRunBody, "latin1"),
+	Buffer.from([0x04, 0x00, 0x00, 0x00]), // Visualization framing
+	Buffer.from("@jdR MS Sans Serif@", "latin1"), // Visualization junk
+]);
+const twoRunPous = decodePro(twoRunSt);
+assert.ok(twoRunPous[0].text.includes("X := TRUE;"), "two-run ST must include the implementation body");
+assert.ok(twoRunPous[0].text.includes("Y := FALSE;"), "two-run ST must include the full implementation");
+assert.ok(!twoRunPous[0].text.includes("MS Sans Serif"), "two-run ST must NOT sweep in Visualization data");
+assert.strictEqual(twoRunPous[0].editable, true, "two-run ST must stay editable");
+
+// 11b. The two-run structure must round-trip through applyPouEdit (edit in the
+// implementation body, past the header/impl seam).
+const twoRunEdit = twoRunPous[0].text.replace("X := TRUE;", "X := FALSE;");
+const twoRunBuf = applyPouEdit(twoRunSt, twoRunPous[0], twoRunEdit);
+const twoRunRe = decodePro(twoRunBuf);
+assert.strictEqual(twoRunRe[0].text, twoRunEdit, "two-run ST edit must round-trip exactly");
 
 console.log("All decoder self-checks passed.");
