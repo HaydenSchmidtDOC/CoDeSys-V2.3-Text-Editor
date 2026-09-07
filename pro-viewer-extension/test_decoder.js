@@ -68,8 +68,8 @@ const net2 = Buffer.from([0x08, 0xff, 0x0b, 0x03, 0x42, 0x42, 0x42]); // 0 fille
 const ladderBody2 = Buffer.concat([net1, net2]);
 const networks = decodeLadderBody(Buffer.concat([Buffer.from("PROGRAM X\r\nVAR\r\nEND_VAR", "latin1"), ladderBody2]), 0, 23 + ladderBody2.length);
 assert.strictEqual(networks.length, 2, "expected 2 separate networks despite differing filler-byte counts");
-assert.strictEqual(networks[0].contacts[0].name, "AAA");
-assert.strictEqual(networks[1].contacts[0].name, "BBB");
+assert.strictEqual(networks[0].elements[0].name, "AAA");
+assert.strictEqual(networks[1].elements[0].name, "BBB");
 
 // 7. AND/OR tree: validated against many real controlled edits (see decoder.js
 // comment) - a stray byte before a contact opens a group (0x09=AND, 0x0A=OR),
@@ -112,6 +112,55 @@ assert.strictEqual(overClosedNets[0].treeOk, false, "over-closing must not be tr
 const badByteNet = Buffer.from([0x08, 0xff, 0x99, 0x0b, 0x03, 0x41, 0x41, 0x41, 0x0b, 0x03, 0x42, 0x42, 0x42]); // unrecognized gap byte
 const badByteNets = decodeLadderBody(Buffer.concat([Buffer.from("PROGRAM X\r\nVAR\r\nEND_VAR", "latin1"), badByteNet]), 0, 23 + badByteNet.length);
 assert.strictEqual(badByteNets[0].treeOk, false, "an unrecognized gap byte must not be trusted");
+
+// 7d. Timer (TON) FB-instance decoding: instance name, PT literal and type name
+// (bare Pascal-string when a PT operand is present), reproduced from the exact
+// bytes of a real corpus rung (ControlledBuffer NETWORK 6 in TEST CORPUS/101079
+// BSL.pro - RunToRearTimer(PT:=T#6000ms), IN chained off contact BRRunToPE,
+// output BRRunToPE NEGATIV/SET). Cross-checked against TEST CORPUS/EXPORT.EXP.
+const timerNet = Buffer.from([
+	0x08, 0xff, 0x09, // network marker + AND-group open
+	0x0b, 0x09, ...Buffer.from("BRRunToPE"), // contact, non-terminal
+	0x45, 0x0e, ...Buffer.from("RunToRearTimer"), // FB instance, terminal (closes group)
+	0x00, 0x41, 0x08, ...Buffer.from("T#6000ms"), // PT literal
+	0x03, ...Buffer.from("TON"), // bare Pascal-string type name (no tag byte)
+	0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // fixed 8-byte trailer
+	0x01, 0x00, 0x03, 0x09, ...Buffer.from("BRRunToPE"), // 1-entry output list: NEGATIV/SET
+]);
+const timerNets = decodeLadderBody(Buffer.concat([Buffer.from("PROGRAM X\r\nVAR\r\nEND_VAR", "latin1"), timerNet]), 0, 23 + timerNet.length);
+assert.strictEqual(timerNets[0].treeOk, true, "timer rung must produce a fully-balanced tree");
+const timerRendered = renderLadderNetworks(timerNets);
+assert.ok(timerRendered.includes("BRRunToPE AND RunToRearTimer:TON(PT:=T#6000ms)"), "expected decoded timer call with instance/type/PT");
+assert.ok(timerRendered.includes("BRRunToPE := NOT TRUE; // SET"), "expected the network's NEGATIV/SET output coil");
+
+// 7e. Cascaded timers with a nested group right after a non-terminal FB's own
+// trailing bytes (PT + type name + 8-byte trailer) must not be misread as
+// AND/OR grammar, and the real gap byte immediately after that trailer must
+// still be trusted (reproduced from HybridControl NETWORK 16 in the same
+// corpus file - RunRelJamTimer OR (InductPE1 AND RunToReleaseTimer)).
+const cascadeNet = Buffer.from([
+	0x08, 0xff, 0x09, // network marker + AND-group open
+	0x0b, 0x08, ...Buffer.from("BRRunRel"), // contact, non-terminal
+	0x4a, // OR-group open (with rightmost-spine bit)
+	0x05, 0x0e, ...Buffer.from("RunRelJamTimer"), // FB, non-terminal (first child of OR)
+	0x00, 0x41, 0x08, ...Buffer.from("T#4000ms"),
+	0x03, ...Buffer.from("TON"),
+	0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // trailer
+	0x49, // AND-group open (with rightmost-spine bit) - must still be trusted after the trailer
+	0x0b, 0x09, ...Buffer.from("InductPE1"), // contact, non-terminal
+	0x45, 0x11, ...Buffer.from("RunToReleaseTimer"), // FB, terminal (closes AND; OR auto-closes at network end)
+	0x00, 0x41, 0x08, ...Buffer.from("T#1000ms"),
+	0x03, ...Buffer.from("TON"),
+	0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x01, 0x00, 0x03, 0x08, ...Buffer.from("BRRunRel"),
+]);
+const cascadeNets = decodeLadderBody(Buffer.concat([Buffer.from("PROGRAM X\r\nVAR\r\nEND_VAR", "latin1"), cascadeNet]), 0, 23 + cascadeNet.length);
+assert.strictEqual(cascadeNets[0].treeOk, true, "cascaded-timer rung must produce a fully-balanced tree");
+const cascadeRendered = renderLadderNetworks(cascadeNets);
+assert.ok(
+	cascadeRendered.includes("BRRunRel AND (RunRelJamTimer:TON(PT:=T#4000ms) OR (InductPE1 AND RunToReleaseTimer:TON(PT:=T#1000ms)))"),
+	"expected the nested OR(FB, AND(contact, FB)) tree, not a flattened 3-way OR"
+);
 
 // 8. Syntax checker: balanced text passes, a dropped END_IF / stray paren fails.
 assert.strictEqual(checkStSyntax("IF X THEN\r\nY := (A + B);\r\nEND_IF\r\n").ok, true);

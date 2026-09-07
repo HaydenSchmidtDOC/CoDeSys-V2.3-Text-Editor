@@ -60,13 +60,28 @@ const LD_OUTPUT_TAGS = {
 	0x02: { polarity: "POSITIV", mode: "SET" },
 	0x03: { polarity: "NEGATIV", mode: "SET" },
 };
-const LD_FBINST_TAGS = new Set([0x05, 0x45]);
 const LD_TIMELIT_TAG = 0x41;
+// FB type name (e.g. "TON", "R_TRIG") when the instance has no PT/time-literal
+// operand: stored as an ordinary tagged [tag][len][ascii] record like any
+// contact/output. When a PT operand IS present (timer types), the type name
+// instead follows the PT record as a bare, tag-less length-prefixed string
+// (see readPascalTypeName) - two different encodings for the same field,
+// confirmed against BagFound (R_TRIG, no PT) vs RunToRearTimer (TON, has PT).
+const LD_FBTYPE_TAG = 0x40;
+
+/** Renders a leaf node: a contact ({name, negated}) or a timer/FB-instance
+ * ({name, fb: true, fbType, pt}) - see decodeLadderBody. */
+function renderLeaf(node) {
+	if (!node.fb) return node.negated ? `NOT ${node.name}` : node.name;
+	const type = node.fbType ? `:${node.fbType}` : "";
+	const pt = node.pt ? `PT:=${node.pt}` : "";
+	return `${node.name}${type}(${pt})`;
+}
 
 /** Renders one node of a parsed AND/OR tree (see decodeLadderBody). A leaf is
- * a contact ({name, negated}); a group node is {type: "AND"|"OR", children}. */
+ * a contact/FB-instance (see renderLeaf); a group node is {type: "AND"|"OR", children}. */
 function renderTreeNode(node) {
-	if (!("children" in node)) return node.negated ? `NOT ${node.name}` : node.name;
+	if (!("children" in node)) return renderLeaf(node);
 	const parts = node.children.map((child) => {
 		const rendered = renderTreeNode(child);
 		return "children" in child && child.children.length > 1 ? `(${rendered})` : rendered;
@@ -142,6 +157,28 @@ function decodeLadderBody(buf, startOffset, endOffset) {
 	let stack = null; // stack of open group nodes for the current network's tree
 	let lastEnd = bodyStart;
 	let prevWasContact = false;
+	const consumedByFb = new Set(); // indices of TIMELIT records folded into a preceding FB leaf as its PT
+
+	// FB-instance records (a TON/TOF/TP/R_TRIG/... call site) are followed by,
+	// in order: optionally a single-gap-byte TIMELIT record (the PT operand -
+	// only present for timer types), then a Pascal-style length-prefixed type
+	// name (e.g. 03 54 4f 4e = "TON") and an 8-byte trailer, neither of which
+	// the generic [tag][len][name] scanner above can parse (they're not that
+	// shape) so they're read directly from the buffer here. See README/task
+	// notes: confirmed byte-for-byte against RunToRearTimer/RunRelJamTimer/
+	// RunToReleaseTimer in the real corpus.
+	function readPascalTypeName(offset, limit) {
+		if (offset + 1 > limit) return null;
+		const len = buf[offset];
+		if (len < 1 || len > 20 || offset + 1 + len > limit) return null;
+		let name = "";
+		for (let k = 0; k < len; k++) {
+			const c = buf[offset + 1 + k];
+			if (!((c >= 65 && c <= 90) || c === 95)) return null; // A-Z or '_' (e.g. R_TRIG)
+			name += String.fromCharCode(c);
+		}
+		return name;
+	}
 
 	function finalizeCurrent() {
 		// A group that's still open when the network's last contact is reached
@@ -153,7 +190,9 @@ function decodeLadderBody(buf, startOffset, endOffset) {
 		if (current) stack.length = 1;
 	}
 
-	for (const rec of records) {
+	for (let ri = 0; ri < records.length; ri++) {
+		if (consumedByFb.has(ri)) continue;
+		const rec = records[ri];
 		const windowStart = Math.max(lastEnd, rec.offset - BOUNDARY_LOOKBACK);
 		const between = buf.subarray(windowStart, rec.offset);
 		let markerPos = -1;
@@ -169,7 +208,7 @@ function decodeLadderBody(buf, startOffset, endOffset) {
 			finalizeCurrent();
 			gap = markerPos !== -1 ? buf.subarray(markerPos + 2, rec.offset) : Buffer.alloc(0);
 			const root = { type: "AND", children: [] };
-			current = { contacts: [], output: null, fbInstances: [], tree: root, treeOk: true };
+			current = { elements: [], outputs: [], fbInstances: [], tree: root, treeOk: true };
 			networks.push(current);
 			stack = [root];
 			freshNetwork = true;
@@ -178,15 +217,18 @@ function decodeLadderBody(buf, startOffset, endOffset) {
 		}
 
 		const base = rec.tag & ~(LD_CONTACT_NEGATED_BIT | 0x40);
-		if (base === LD_CONTACT_BASE_TAG) {
+		const isContact = base === LD_CONTACT_BASE_TAG;
+		const isFb = (rec.tag & ~0x40) === 0x05; // 0x05 = non-terminal instance, 0x45 = terminal (closes group)
+		let fbTrailerConsumed = false; // did we precisely locate the end of this FB's own trailing bytes?
+		if (isContact || isFb) {
 			// Only trust gap bytes as AND/OR grammar when they sit directly between
-			// two contacts (or right after a network's "08 FF" marker). If the
-			// previous record was an FB-instance/time-literal, the bytes since then
-			// are that record's own parameter data (e.g. a TON's preset/output
-			// bits), not open/close bytes - a real network (HybridControl net 16)
-			// has an FB instance and timer sitting between two plain-AND contacts,
-			// and its trailing parameter bytes would otherwise look like garbage
-			// "open" bytes and wrongly kill the whole network's tree.
+			// two contacts/FB-instances (or right after a network's "08 FF"
+			// marker). Otherwise the bytes since the last one are that record's
+			// own parameter data (PT literal, type name, trailer), not open/close
+			// bytes - a real network (HybridControl net 16) has an FB instance and
+			// timer sitting between two plain-AND contacts, and its trailing
+			// parameter bytes would otherwise look like garbage "open" bytes and
+			// wrongly kill the whole network's tree.
 			if (!freshNetwork && !prevWasContact) gap = Buffer.alloc(0);
 			for (const g of gap) {
 				const opType = (g & ~0x40) === 0x09 ? "AND" : (g & ~0x40) === 0x0a ? "OR" : null;
@@ -198,8 +240,46 @@ function decodeLadderBody(buf, startOffset, endOffset) {
 				stack[stack.length - 1].children.push(node);
 				stack.push(node);
 			}
-			const leaf = { name: rec.name, negated: (rec.tag & LD_CONTACT_NEGATED_BIT) !== 0 };
-			current.contacts.push(leaf);
+
+			let leaf;
+			let consumedEnd = rec.offset + 2 + rec.name.length;
+			if (isContact) {
+				leaf = { name: rec.name, negated: (rec.tag & LD_CONTACT_NEGATED_BIT) !== 0 };
+			} else {
+				// A single-gap-byte TIMELIT record immediately following is this
+				// FB's PT operand (timer types only - e.g. R_TRIG has none).
+				let pt = null;
+				let fbType = null;
+				const nextRec = records[ri + 1];
+				if (nextRec && nextRec.tag === LD_TIMELIT_TAG && nextRec.offset - consumedEnd <= 4) {
+					pt = nextRec.name;
+					consumedEnd = nextRec.offset + 2 + nextRec.name.length;
+					consumedByFb.add(ri + 1);
+					// With a PT operand present, the type name follows as a bare
+					// tag-less length-prefixed string, not a normal tagged record.
+					fbType = readPascalTypeName(consumedEnd, endOffset);
+					if (fbType) {
+						const typeEnd = consumedEnd + 1 + fbType.length;
+						// The 8-byte trailer (01 00 00 00 00 00 00 00) is identical in
+						// every timer instance seen across the whole test corpus - skip
+						// it exactly so the real gap bytes for the *next* element (which
+						// can legitimately open an AND/OR group - see HybridControl net
+						// 16, RunRelJamTimer OR (InductPE1 AND RunToReleaseTimer)) aren't
+						// drowned out by this FB's own trailing bytes.
+						const trailer = buf.subarray(typeEnd, typeEnd + 8);
+						if (trailer.length === 8 && trailer[0] === 1 && trailer.subarray(1).every((b) => b === 0)) {
+							consumedEnd = typeEnd + 8;
+							fbTrailerConsumed = true;
+						}
+					}
+				} else if (nextRec && nextRec.tag === LD_FBTYPE_TAG && nextRec.offset - consumedEnd <= 4) {
+					fbType = nextRec.name;
+					consumedEnd = nextRec.offset + 2 + nextRec.name.length;
+					consumedByFb.add(ri + 1);
+				}
+				leaf = { name: rec.name, fb: true, fbType, pt };
+			}
+			current.elements.push(leaf);
 			if (current.treeOk) {
 				stack[stack.length - 1].children.push(leaf);
 				if (rec.tag & 0x40) {
@@ -207,15 +287,26 @@ function decodeLadderBody(buf, startOffset, endOffset) {
 					else stack.pop();
 				}
 			}
+			lastEnd = consumedEnd;
 		} else if (Object.prototype.hasOwnProperty.call(LD_OUTPUT_TAGS, rec.tag)) {
-			current.output = { name: rec.name, ...LD_OUTPUT_TAGS[rec.tag] };
-		} else if (LD_FBINST_TAGS.has(rec.tag)) {
-			current.fbInstances.push(rec.name);
+			current.outputs.push({ name: rec.name, ...LD_OUTPUT_TAGS[rec.tag] });
+			lastEnd = rec.offset + 2 + rec.name.length;
 		} else if (rec.tag === LD_TIMELIT_TAG) {
-			current.fbInstances.push(`T#${rec.name}`);
+			// A PT literal not immediately following an FB-instance record -
+			// shouldn't happen in valid data, kept only as a diagnostic fallback.
+			current.fbInstances.push(rec.name);
+			lastEnd = rec.offset + 2 + rec.name.length;
+		} else {
+			lastEnd = rec.offset + 2 + rec.name.length;
 		}
-		prevWasContact = base === LD_CONTACT_BASE_TAG;
-		lastEnd = rec.offset + 2 + rec.name.length;
+		// An FB-instance record is followed by its own trailing param bytes
+		// (optional PT, Pascal-style type name, trailer) before the next real
+		// record - those must never be trusted as AND/OR grammar. Once we've
+		// precisely located the end of that trailer (fbTrailerConsumed), lastEnd
+		// already points past it, so the *next* gap is genuine and safe to trust
+		// (needed for e.g. HybridControl net 16's nested group right after a
+		// timer). Otherwise stay conservative and suppress, as before.
+		prevWasContact = isContact || (isFb && fbTrailerConsumed);
 	}
 	finalizeCurrent();
 
@@ -234,23 +325,25 @@ function renderLadderNetworks(networks) {
 	];
 	networks.forEach((net, idx) => {
 		let condStr;
-		if (!net.contacts.length) {
+		if (!net.elements.length) {
 			condStr = "(no contacts decoded)";
 		} else if (net.treeOk) {
 			condStr = renderTreeNode(net.tree);
 		} else {
-			condStr = net.contacts.map((c) => (c.negated ? `NOT ${c.name}` : c.name)).join(" <AND/OR: MIXED, unresolved> ");
+			condStr = net.elements.map(renderLeaf).join(" <AND/OR: MIXED, unresolved> ");
 		}
 		lines.push(`NETWORK ${idx + 1}:`);
 		lines.push(`  IF ${condStr} THEN`);
-		if (net.output) {
-			const neg = net.output.polarity === "NEGATIV" ? "NOT " : "";
-			lines.push(`    ${net.output.name} := ${neg}TRUE; // ${net.output.mode}`);
+		if (net.outputs.length) {
+			for (const out of net.outputs) {
+				const neg = out.polarity === "NEGATIV" ? "NOT " : "";
+				lines.push(`    ${out.name} := ${neg}TRUE; // ${out.mode}`);
+			}
 		} else {
 			lines.push("    (no output decoded)");
 		}
 		if (net.fbInstances.length) {
-			lines.push(`    // referenced FB instances / literals: ${net.fbInstances.join(", ")}`);
+			lines.push(`    // unattached PT literal(s), unexpected: ${net.fbInstances.join(", ")}`);
 		}
 	});
 	return lines.join("\r\n");
