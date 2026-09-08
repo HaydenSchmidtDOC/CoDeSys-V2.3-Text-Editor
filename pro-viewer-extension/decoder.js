@@ -257,7 +257,16 @@ function decodeLadderBody(buf, startOffset, endOffset) {
 		// trailing 0x40. So simply auto-close whatever's left open; a *broken*
 		// tree (invalid gap byte, or a close popping past the root mid-network)
 		// was already flagged via treeOk=false above and stays flagged.
-		if (current) stack.length = 1;
+		if (current) {
+			stack.length = 1;
+			// The last network's body ends at the end of its output records.
+			// There is NO comment block after the last network (the POU's
+			// trailing metadata follows immediately), so commentBytes is empty.
+			if (current.endOffset === undefined) {
+				current.endOffset = lastEnd;
+				current.commentBytes = Buffer.alloc(0);
+			}
+		}
 	}
 
 	for (let ri = 0; ri < records.length; ri++) {
@@ -275,10 +284,18 @@ function decodeLadderBody(buf, startOffset, endOffset) {
 		let gap;
 		let freshNetwork = false;
 		if (current === null || markerPos !== -1) {
+			// A new network's 08 FF marker: the previous network ends here.
+			// The bytes between its last record and the marker are its comment
+			// block ([len] [00 00 00] [comment] [00], or 00 00 00 00 00 when
+			// empty) - captured so the encoder can re-emit them verbatim.
+			if (current) {
+				current.endOffset = markerPos;
+				current.commentBytes = buf.subarray(lastEnd, markerPos);
+			}
 			finalizeCurrent();
 			gap = markerPos !== -1 ? buf.subarray(markerPos + 2, rec.offset) : Buffer.alloc(0);
 			const root = { type: "AND", children: [] };
-			current = { elements: [], outputs: [], fbInstances: [], tree: root, treeOk: true };
+			current = { elements: [], outputs: [], fbInstances: [], tree: root, treeOk: true, startOffset: markerPos !== -1 ? markerPos : bodyStart };
 			networks.push(current);
 			stack = [root];
 			freshNetwork = true;
@@ -307,8 +324,17 @@ function decodeLadderBody(buf, startOffset, endOffset) {
 					continue;
 				}
 				const node = { type: opType, children: [] };
-				stack[stack.length - 1].children.push(node);
+				const parent = stack[stack.length - 1];
+				parent.children.push(node);
 				stack.push(node);
+				// 0x40 on an OPEN marks the PARENT as "closes after this group"
+				// (this group is the parent's last child). When the group closes
+				// (via a leaf's 0x40 or the network end), the marked parent closes
+				// too - a cascade up through all marked ancestors. This is the
+				// "last child of the current list" rule from the 2026-09 analysis,
+				// and it fixes HybridControl NET 15 + Intrusion NET 2 (the old
+				// "ignore 0x40 on opens" model silently produced wrong nesting).
+				if (g & 0x40) parent._marked = true;
 			}
 
 			let leaf;
@@ -365,8 +391,14 @@ function decodeLadderBody(buf, startOffset, endOffset) {
 			if (current.treeOk) {
 				stack[stack.length - 1].children.push(leaf);
 				if (rec.tag & 0x40) {
+					// 0x40 on a leaf: it's the last child of the innermost group,
+					// which closes. Then cascade: any marked ancestor (a group
+					// whose last child was the group we just closed) closes too.
 					if (stack.length <= 1) current.treeOk = false;
-					else stack.pop();
+					else {
+						stack.pop();
+						while (stack.length > 1 && stack[stack.length - 1]._marked) stack.pop();
+					}
 				}
 			}
 			lastEnd = consumedEnd;
@@ -686,7 +718,7 @@ function decodePro(buf) {
 			}
 		}
 
-		results.push({ name, text, truncated: false, editable, positions: editable ? positions : null });
+		results.push({ name, text, truncated: false, editable, positions: editable ? positions : null, _startOffset: start, _endOffset: nextStart });
 	}
 
 	return results;
@@ -828,4 +860,409 @@ function checkStSyntax(text) {
 	return { ok: false, error: `Line ${first.line}: ${first.message}` };
 }
 
-module.exports = { decodePro, applyPouEdit, decodeLadderBody, renderLadderNetworks, checkStSyntax };
+// ---------------------------------------------------------------------------
+// LD write-back: encode a decoded network tree back into the binary LD body.
+//
+// Serialization (confirmed 2026-09 against the real corpus + a TwinCat ladder
+// printout): every element is [gap bytes] [tag] [name]. Gap bytes are the
+// structure nodes (09 = series/AND open, 0a = parallel/OR open); the tag is
+// the element record (0b = contact, 0x80 = negated, 0x45/0x05 = FB instance,
+// 0x41 = literal). The 0x40 bit marks the LAST child of the current list:
+// on a leaf it terminates its block, on an open it marks the parent as
+// closing after this group (the cascade-close model). Coils are NOT
+// distinguished by the tag byte - they are a trailing pin-reference list:
+// [count] [00] then per output [coiltype] [len] [name] (coiltype 0 = DIRECT,
+// 2 = SET, 3 = RESET). FB instances: [tag] [len] [name] [00] [0x41] [len]
+// [PT] [len] [type] [8-byte trailer] for timers, or [tag] [len] [name]
+// [0x40] [len] [type] [6-byte trailer] for edge-detect types. Network
+// comments are stored between networks as [len] [00 00 00] [comment] [00]
+// (or 00 00 00 00 00 when empty) and are re-emitted verbatim.
+// ---------------------------------------------------------------------------
+
+/** Serializes a decoded network tree back into LD binary bytes.
+ * `networks` is the array produced by decodeLadderBody (each has `.tree`,
+ * `.outputs`, `.commentBytes`). Returns a Buffer of the full LD body bytes
+ * (starting at the first network's 08 FF marker). */
+function encodeLadderNetworks(networks) {
+	const out = [];
+	const push = (b) => out.push(b);
+	const pushName = (name) => {
+		const bytes = Buffer.from(name, "latin1");
+		if (bytes.length < 1 || bytes.length > 40) throw new Error(`LD name too long: ${name}`);
+		push(bytes.length);
+		for (const b of bytes) push(b);
+	};
+	const pushRecord = (tag, name) => {
+		push(tag);
+		pushName(name);
+	};
+
+	// Depth-first serialization. `isLast` = this node is the last child of its
+	// parent group; `isRootChild` = this node is a direct child of the root
+	// (root children never carry 0x40 - the network end implies their close).
+	function emitNode(node, isLast, isRootChild) {
+		if (!("children" in node)) {
+			// Leaf: contact or FB instance.
+			if (node.fb) {
+				let tag = 0x05;
+				if (isLast && !isRootChild) tag |= 0x40;
+				pushRecord(tag, node.name);
+				if (node.pt) {
+					// Timer: [00] [0x41] [len] [PT] [len] [type] [8-byte trailer].
+					push(0x00);
+					pushRecord(0x41, node.pt);
+					const typeBytes = Buffer.from(node.fbType || "TON", "latin1");
+					push(typeBytes.length);
+					for (const b of typeBytes) push(b);
+					push(0x01);
+					for (let i = 0; i < 7; i++) push(0);
+				} else {
+					// Edge-detect: [0x40] [len] [type] [6-byte trailer].
+					pushRecord(0x40, node.fbType || "R_TRIG");
+					for (let i = 0; i < 6; i++) push(0);
+				}
+			} else {
+				let tag = 0x0b;
+				if (node.negated) tag |= 0x80;
+				if (isLast && !isRootChild) tag |= 0x40;
+				pushRecord(tag, node.name);
+			}
+			return;
+		}
+		// Group node: emit its open byte, then children.
+		let openByte = node.type === "AND" ? 0x09 : 0x0a;
+		if (isLast && !isRootChild) openByte |= 0x40;
+		push(openByte);
+		for (let i = 0; i < node.children.length; i++) {
+			emitNode(node.children[i], i === node.children.length - 1, false);
+		}
+	}
+
+	for (const net of networks) {
+		// Network boundary marker.
+		push(0x08);
+		push(0xff);
+		// The tree root is a synthetic AND wrapper - emit its children.
+		const root = net.tree || { type: "AND", children: net.elements || [] };
+		const children = root.children && root.children.length ? root.children : net.elements || [];
+		for (let i = 0; i < children.length; i++) {
+			emitNode(children[i], i === children.length - 1, true);
+		}
+		// Outputs: [count] [00] then per output [coiltype] [len] [name].
+		const outputs = net.outputs || [];
+		if (outputs.length) {
+			push(outputs.length);
+			push(0x00);
+			for (const out of outputs) {
+				const tag = out.mode === "SET" ? 0x02 : out.mode === "RESET" ? 0x03 : 0x00;
+				pushRecord(tag, out.name);
+			}
+		}
+		// Re-emit the network's comment block verbatim (empty for the last
+		// network - the POU's trailing metadata follows immediately).
+		if (net.commentBytes && net.commentBytes.length) {
+			for (const b of net.commentBytes) push(b);
+		}
+	}
+	return Buffer.from(out);
+}
+
+/**
+ * Applies an edited LD POU's text back into the buffer. The edited text is
+ * the rendered form (NETWORK n: / FB calls / IF ... THEN / coil := ...).
+ * Strategy: decode the ORIGINAL body into networks (with exact byte ranges),
+ * then for each network compare the ORIGINAL rendered form against the
+ * corresponding block of the edited text. Unchanged networks keep their
+ * original bytes verbatim (so the imperfectly-understood 0x40 corner cases
+ * can never corrupt them); changed networks are re-encoded from their parsed
+ * tree. Returns the new buffer.
+ */
+function applyLdPouEdit(buf, pou, newText) {
+	const start = pou._startOffset;
+	const limit = pou._endOffset;
+	if (start === undefined) throw new Error(`Cannot save ${pou.name}: missing offset info.`);
+
+	// Decode the original body into networks with byte ranges.
+	const oldNetworks = decodeLadderBody(buf, start, limit);
+	if (!oldNetworks.length) throw new Error(`Cannot save ${pou.name}: no ladder networks found.`);
+
+	// Split the edited text into per-network blocks (NETWORK n: ... up to the
+	// next NETWORK line or end).
+	const newBlocks = splitNetworkBlocks(newText);
+	if (!newBlocks.length) throw new Error(`Cannot save ${pou.name}: no NETWORK blocks found in edited text.`);
+
+	// Render each original network for comparison (network numbers normalized
+	// to 1-based index so the comparison is position-based, not label-based).
+	const oldRendered = oldNetworks.map((net, idx) =>
+		renderLadderNetworks([net]).trim().replace(/^NETWORK \d+:/, `NETWORK ${idx + 1}:`)
+	);
+
+	const parts = [];
+	for (let i = 0; i < newBlocks.length; i++) {
+		const oldNet = i < oldNetworks.length ? oldNetworks[i] : null;
+		const newBlock = newBlocks[i];
+		const oldRender = i < oldRendered.length ? oldRendered[i] : null;
+		if (oldNet && oldRender && oldRender === newBlock.trim()) {
+			// Unchanged: preserve the original bytes. The network's bytes run
+			// from its 08 FF marker to the NEXT network's marker (or the body
+			// end for the last network) - the comment block sits between them.
+			const end = i + 1 < oldNetworks.length ? oldNetworks[i + 1].startOffset : oldNet.endOffset;
+			parts.push(buf.subarray(oldNet.startOffset, end));
+		} else {
+			// Changed (or added): re-encode, preserving the original comment.
+			const parsed = parseRenderedLadder(newBlock);
+			if (!parsed.length) throw new Error(`Cannot save ${pou.name}: could not parse NETWORK ${i + 1}.`);
+			const encoded = encodeLadderNetworks(parsed);
+			const comment = oldNet && oldNet.commentBytes ? oldNet.commentBytes : Buffer.alloc(0);
+			parts.push(Buffer.concat([encoded, comment]));
+		}
+	}
+
+	// Splice the new body over the old body region.
+	const bodyStart = oldNetworks[0].startOffset;
+	const lastEnd = oldNetworks[oldNetworks.length - 1].endOffset;
+	const newBody = Buffer.concat(parts);
+	return Buffer.concat([buf.subarray(0, bodyStart), newBody, buf.subarray(lastEnd)]);
+}
+
+/** Splits rendered ladder text into per-network blocks. The POU header
+ * (PROGRAM/VAR blocks) precedes the first NETWORK line and is skipped. */
+function splitNetworkBlocks(text) {
+	const lines = text.split(/\r?\n/);
+	const blocks = [];
+	let current = null;
+	for (const line of lines) {
+		if (/^\s*NETWORK\s+\d+:\s*$/.test(line)) {
+			if (current) blocks.push(current.join("\r\n"));
+			current = [line];
+		} else if (current) {
+			current.push(line);
+		}
+	}
+	if (current) blocks.push(current.join("\r\n"));
+	return blocks;
+}
+
+/** Structural equality of two decoded networks (tree + outputs). Trees are
+ * normalized first (single-child groups flattened) because the decoder wraps
+ * chains in explicit groups while the parser produces flat trees - both are
+ * the same ladder logic and must compare equal. */
+function networksEqual(a, b) {
+	if (a.outputs.length !== b.outputs.length) return false;
+	for (let i = 0; i < a.outputs.length; i++) {
+		if (a.outputs[i].name !== b.outputs[i].name || a.outputs[i].mode !== b.outputs[i].mode) return false;
+	}
+	return treesEqual(normalizeTree(a.tree), normalizeTree(b.tree));
+}
+
+/** Flattens single-child groups (the renderer emits them unwrapped). */
+function normalizeTree(node) {
+	if (!("children" in node)) return node;
+	const children = node.children.map(normalizeTree);
+	// A single-child group renders identically to its child - flatten it.
+	if (children.length === 1) return children[0];
+	return { type: node.type, children };
+}
+
+function treesEqual(a, b) {
+	if (("children" in a) !== ("children" in b)) return false;
+	if (!("children" in a)) {
+		if (!!a.fb !== !!b.fb) return false;
+		if (a.name !== b.name) return false;
+		if (!!a.negated !== !!b.negated) return false;
+		if (a.fb && (a.fbType !== b.fbType || (a.pt || null) !== (b.pt || null))) return false;
+		return true;
+	}
+	if (a.type !== b.type || a.children.length !== b.children.length) return false;
+	for (let i = 0; i < a.children.length; i++) {
+		if (!treesEqual(a.children[i], b.children[i])) return false;
+	}
+	return true;
+}
+
+/** Parses the rendered ladder text (NETWORK n: / FB calls / IF ... THEN /
+ * coil := ...) back into a network tree. This is the inverse of
+ * renderLadderNetworks. */
+function parseRenderedLadder(text) {
+	const networks = [];
+	const lines = text.split(/\r?\n/);
+	let current = null;
+	for (const line of lines) {
+		const netMatch = line.match(/^\s*NETWORK\s+(\d+):\s*$/);
+		if (netMatch) {
+			current = { elements: [], outputs: [], fbCalls: [], ifExpr: null, tree: null };
+			networks.push(current);
+			continue;
+		}
+		if (!current) continue;
+		const fbCall = line.match(/^\s*(\w+)\s*\(\s*(IN|CLK):=([^,]+?)(?:,\s*PT:=([^)]+))?\)\s*;\s*$/);
+		if (fbCall) {
+			current.fbCalls.push({
+				name: fbCall[1],
+				inExpr: fbCall[3].trim(),
+				pt: fbCall[4] ? fbCall[4].trim() : null,
+				fbType: fbCall[2] === "CLK" ? "R_TRIG" : "TON",
+			});
+			continue;
+		}
+		const ifMatch = line.match(/^\s*IF\s+(.+?)\s+THEN\s*$/);
+		if (ifMatch) {
+			current.ifExpr = ifMatch[1].trim();
+			continue;
+		}
+		const coilMatch = line.match(/^\s*(\w+)\s*:=\s*(DIRECT|SET|RESET)\s*;\s*$/);
+		if (coilMatch) {
+			current.outputs.push({ name: coilMatch[1], mode: coilMatch[2] });
+			continue;
+		}
+	}
+	for (const net of networks) {
+		net.tree = buildTreeFromRendered(net.ifExpr, net.fbCalls);
+	}
+	return networks;
+}
+
+/** Builds a network tree from the rendered IF expression + FB call lines.
+ * The IF expression carries the structure (with .Q references as FB leaves);
+ * the FB calls supply each FB's type and PT. The FB's IN wiring is derived
+ * from the tree on re-decode (assignFbWiring), so the encoder only needs the
+ * FB leaf in the right tree position - but the IN chain elements that feed
+ * the FB must be present in the tree, so they are reconstructed from the
+ * call's IN expression when missing. */
+function buildTreeFromRendered(ifExpr, fbCalls) {
+	if (!ifExpr) return { type: "AND", children: [] };
+	let tree = parseBooleanExpr(ifExpr);
+	// Always keep a group at the top so the encoder's emitNode has a root.
+	if (!("children" in tree)) tree = { type: "AND", children: [tree] };
+	// Convert .Q leaves into FB leaves with type/PT from the calls.
+	convertFbLeaves(tree, fbCalls);
+	// Reconstruct IN chains: the rendered IF expression references only the
+	// FB's .Q output, but the binary tree carries the FB's IN elements as
+	// siblings in the same AND chain. Insert them before the FB leaf.
+	reconstructInChains(tree, fbCalls);
+	return tree;
+}
+
+function convertFbLeaves(node, fbCalls) {
+	if (!("children" in node)) {
+		if (node.name && node.name.endsWith(".Q")) {
+			const fbName = node.name.slice(0, -2);
+			const call = fbCalls.find((c) => c.name === fbName);
+			node.fb = true;
+			node.name = fbName;
+			node.fbType = call ? call.fbType : "TON";
+			node.pt = call ? call.pt : null;
+		}
+		return;
+	}
+	for (const child of node.children) convertFbLeaves(child, fbCalls);
+}
+
+/** Reconstructs FB IN chains: for each FB leaf, insert the elements of its
+ * IN expression (from the call line) as siblings immediately before it in
+ * the same AND group. The rendered IF only references the FB's .Q, but the
+ * binary tree carries the IN elements as part of the rail. */
+function reconstructInChains(tree, fbCalls) {
+	function walk(node) {
+		if (!("children" in node)) return;
+		for (let i = 0; i < node.children.length; i++) {
+			const child = node.children[i];
+			if (!("children" in child) && child.fb) {
+				const call = fbCalls.find((c) => c.name === child.name);
+				if (call && call.inExpr && call.inExpr !== "TRUE") {
+					const inElements = parseInElements(call.inExpr);
+					// Insert missing IN elements before the FB in the same group.
+					const existing = node.children
+						.slice(0, i)
+						.filter((c) => !("children" in c))
+						.map((c) => (c.negated ? "NOT " : "") + c.name);
+					const missing = inElements.filter((el) => !existing.includes(el));
+					if (missing.length) {
+						node.children.splice(i, 0, ...missing);
+						i += missing.length;
+					}
+				}
+			} else {
+				walk(child);
+			}
+		}
+	}
+	walk(tree);
+}
+
+/** Parses an FB IN expression into a list of AND-separated element names. */
+function parseInElements(expr) {
+	const parts = [];
+	let depth = 0, last = 0;
+	for (let i = 0; i < expr.length; i++) {
+		const c = expr[i];
+		if (c === "(") depth++;
+		else if (c === ")") depth--;
+		else if (depth === 0 && expr.startsWith("AND", i)) {
+			parts.push(expr.slice(last, i).trim());
+			i += 2;
+			last = i + 1;
+		}
+	}
+	parts.push(expr.slice(last).trim());
+	return parts.filter((p) => p.length).map((p) => {
+		const neg = p.startsWith("NOT ");
+		const name = neg ? p.slice(4).trim() : p.trim();
+		return { name, negated: neg };
+	});
+}
+
+/** Parses a boolean expression (AND/OR/NOT/parens) into a tree. This is the
+ * inverse of renderTree. Handles the subset the renderer emits. */
+function parseBooleanExpr(expr) {
+	// Tokenize: identifiers, NOT, AND, OR, parens.
+	const tokens = [];
+	let i = 0;
+	while (i < expr.length) {
+		const c = expr[i];
+		if (c === " " || c === "\t") { i++; continue; }
+		if (c === "(") { tokens.push("("); i++; continue; }
+		if (c === ")") { tokens.push(")"); i++; continue; }
+		if (/[A-Za-z_]/.test(c)) {
+			let j = i;
+			while (j < expr.length && /[A-Za-z0-9_.]/.test(expr[j])) j++;
+			const word = expr.slice(i, j);
+			if (word === "AND" || word === "OR" || word === "NOT") tokens.push(word);
+			else tokens.push({ name: word });
+			i = j;
+			continue;
+		}
+		throw new Error(`Cannot parse ladder expression near: ${expr.slice(i, i + 20)}`);
+	}
+	// Recursive descent: OR -> AND -> NOT -> primary.
+	let pos = 0;
+	function peek() { return tokens[pos]; }
+	function next() { return tokens[pos++]; }
+	function parseOr() {
+		let left = parseAnd();
+		while (peek() === "OR") { next(); const right = parseAnd(); left = { type: "OR", children: [left, right] }; }
+		return left;
+	}
+	function parseAnd() {
+		let left = parseNot();
+		while (peek() === "AND") { next(); const right = parseNot(); left = { type: "AND", children: [left, right] }; }
+		return left;
+	}
+	function parseNot() {
+		if (peek() === "NOT") { next(); const child = parseNot(); return { type: "AND", children: [{ name: child.name, negated: true }] }; }
+		return parsePrimary();
+	}
+	function parsePrimary() {
+		const t = next();
+		if (t === "(") {
+			const inner = parseOr();
+			if (next() !== ")") throw new Error("Unbalanced parens in ladder expression");
+			return inner;
+		}
+		if (t && typeof t === "object" && t.name) return { name: t.name };
+		throw new Error("Unexpected token in ladder expression");
+	}
+	return parseOr();
+}
+
+module.exports = { decodePro, applyPouEdit, decodeLadderBody, renderLadderNetworks, checkStSyntax, encodeLadderNetworks, applyLdPouEdit, parseRenderedLadder, networksEqual, splitNetworkBlocks };
