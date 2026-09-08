@@ -1,6 +1,10 @@
 # CoDeSys V2.3 Text Editor for VS Code
 
-A VS Code custom editor + reverse-engineering toolkit for reading and editing CoDeSys V2.3 / Beckhoff TwinCat `.pro` binary project files directly, without needing a manual TwinCat export.
+A VS Code extension + reverse-engineering toolkit for reading and editing CoDeSys V2.3 / Beckhoff TwinCat `.pro` binary project files directly, without needing a manual TwinCat export.
+
+## What it does
+
+When you open a folder that contains a `.pro` file, the extension mounts it as a **virtual folder of Structured Text (`.st`) files — one per POU**. A "CoDeSys POUs" view in the Activity Bar lists every `.pro` in the workspace; expanding one shows its POUs as `.st` files. Clicking a POU opens it as a normal text file with ST syntax highlighting; saving writes the edit back into the `.pro` binary (with a syntax gate + round-trip safety net).
 
 ## Background
 
@@ -8,7 +12,14 @@ TwinCat PLC Control (CoDeSys V2.3) project files (`.pro`) are a proprietary bina
 
 ## Contents
 
-- **`pro-viewer-extension/`** — A VS Code extension (`codesys-v2-text-editor`) that registers itself as the default editor for `*.pro` files, decodes every POU, and lets you edit + save the ones it's confident about. Install via `code --install-extension pro-viewer-extension/codesys-v2-text-editor-0.0.1.vsix`. Self-check: `node pro-viewer-extension/test_decoder.js`.
+- **`pro-viewer-extension/`** — A VS Code extension (`codesys-v2-text-editor`) that mounts `.pro` files as virtual folders of `.st` files:
+  - `virtualfs.js` — a `FileSystemProvider` mapping `codesys-pou://` URIs to `.st` content (read = `decodePro`, write = `applyPouEdit`).
+  - `treeview.js` — auto-discovers `.pro` files in the workspace and lists their POUs.
+  - `uri.js` — URI helpers built on `vscode-uri` (robust path encoding).
+  - `decoder.js` — the binary decode/encode engine (the core reverse-engineering value).
+  - `stcheck.js` — a lightweight ST syntax checker used as a save-time gate.
+  - `syntaxes/st.tmLanguage.json` — a minimal ST TextMate grammar for highlighting.
+  - Install via `code --install-extension pro-viewer-extension/codesys-v2-text-editor-0.2.0.vsix`. Self-checks: `node pro-viewer-extension/test_decoder.js`, `test_stcheck.js`, `test_virtualfs.js`.
 - **`_extracted_pous/`** — A one-off snapshot of decoded POU source extracted early in this project (via the extension's export command). It's just prior output, not a ground truth — the real ground truth used to validate everything below is a manual TwinCat "Export" (`.EXP` text file) of the real project, kept locally alongside the `.pro` and gitignored (not part of this repo).
 - **`_scratch/`** — Python/Node scripts used to reverse-engineer the binary format: printable-run scanning, POU boundary detection, and byte-level correlation against `.EXP` exports (including a controlled before/after edit — see below).
 
@@ -22,8 +33,9 @@ TwinCat PLC Control (CoDeSys V2.3) project files (`.pro`) are a proprietary bina
 - **One known artifact, handled correctly (not just papered over):**
   - A single non-printable framing byte is sometimes dropped between a POU's `END_VAR` and whatever follows on the same line (commonly `END_VAR(*comment*)`) — the missing CRLF is reinserted to recover the real formatting.
 - **Write support: variable-length.** An edit no longer has to keep the POU's byte length identical. Saving finds the common prefix/suffix between the old and new text (anchored to real source byte positions, tracked per-character through both artifact-repairs above) and replaces only the differing middle span, shifting everything after it in the file. This was validated against a real controlled test: renaming a variable (`InterfaceBagReleaseAct` → `...withaddedbytes`, +14 bytes) round-trips exactly and leaves every other POU byte-for-byte unaffected.
+  - **Two-run length prefix is patched on write.** For two-run ST POUs, the implementation body's length is stored in a 16-bit little-endian prefix after the `0x12` separator. When an edit changes the body's length, `applyPouEdit` now locates that prefix (scanning backward from the splice) and patches it, so the body re-decodes at its full new length instead of being truncated to the stale length.
   - **Why this is believed safe:** a systematic search of the real `.pro` file found no absolute byte-offset table anywhere referencing POU text locations (POU "directory" entries only carry a name + timestamps), and no whole-file checksum. That's evidence, not proof — every save is still verified by re-decoding the whole file afterwards and refusing to write if the edited POU doesn't decode back to exactly what was typed, or if *any other* POU's decoded text changed as a side effect.
-  - A tokenizer-based syntax check runs before every save — it strips comments/strings (so keywords inside them don't count), tracks block nesting with a stack, and catches unbalanced or out-of-order blocks, a stray `ELSE`/`ELSIF` outside an `IF`, a declaration keyword inside the implementation (and vice versa), and unbalanced parens/brackets. It is still not a full IEC 61131-3 parser (no type checking, no declaration-vs-use validation) and is not a substitute for a Rebuild in TwinCat.
+  - A recursive-descent syntax check (`stcheck.js`) runs before every save — it strips comments/strings (so keywords inside them don't count), tracks block nesting with a stack, and catches unbalanced or out-of-order blocks, a stray `ELSE`/`ELSIF` outside an `IF`, a declaration keyword inside the implementation (and vice versa), and unbalanced parens/brackets. **Errors block the save; warnings do not.** Undeclared identifiers are warnings, not errors, because in a multi-POU project a POU legitimately references globals declared elsewhere. It is still not a full IEC 61131-3 parser (no type compatibility checking) and is not a substitute for a Rebuild in TwinCat.
   - Of the real project's 27 POUs, 21 currently qualify as editable; the other 6 are the Ladder Diagram POUs below.
 
 ### Ladder Diagram (LD) POUs — decode only, always read-only

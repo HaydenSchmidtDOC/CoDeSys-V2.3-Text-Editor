@@ -173,22 +173,22 @@ assert.ok(
 );
 
 // 8. Syntax checker: balanced text passes, a dropped END_IF / stray paren fails.
-assert.strictEqual(checkStSyntax("IF X THEN\r\nY := (A + B);\r\nEND_IF\r\n").ok, true);
-assert.strictEqual(checkStSyntax("IF X THEN\r\nY := TRUE;\r\n").ok, false, "missing END_IF must fail");
-assert.strictEqual(checkStSyntax("Y := (A + B;\r\n").ok, false, "unbalanced paren must fail");
+assert.strictEqual(checkStSyntax("VAR\r\nX: BOOL;\r\nY: INT;\r\nA, B: INT;\r\nEND_VAR\r\nIF X THEN\r\nY := (A + B);\r\nEND_IF\r\n").ok, true);
+assert.strictEqual(checkStSyntax("VAR\r\nX: BOOL;\r\nY: BOOL;\r\nEND_VAR\r\nIF X THEN\r\nY := TRUE;\r\n").ok, false, "missing END_IF must fail");
+assert.strictEqual(checkStSyntax("VAR\r\nY: INT;\r\nA, B: INT;\r\nEND_VAR\r\nY := (A + B;\r\n").ok, false, "unbalanced paren must fail");
 
 // 8b. Syntax checker must ignore keywords inside comments and strings.
 assert.strictEqual(
-	checkStSyntax("(* IF X THEN *) \r\nY := 'END_IF';\r\n").ok,
+	checkStSyntax("VAR\r\nY: BOOL;\r\nEND_VAR\r\n(* IF X THEN *) \r\nY := 'END_IF';\r\n").ok,
 	true,
 	"keywords inside comments/strings must not count"
 );
 
 // 8c. Syntax checker must catch a stray ELSE outside an IF, and a block closed
 // out of order.
-assert.strictEqual(checkStSyntax("ELSE\r\nY := TRUE;\r\n").ok, false, "stray ELSE outside IF must fail");
+assert.strictEqual(checkStSyntax("VAR\r\nY: BOOL;\r\nEND_VAR\r\nELSE\r\nY := TRUE;\r\n").ok, false, "stray ELSE outside IF must fail");
 assert.strictEqual(
-	checkStSyntax("IF X THEN\r\nCASE Y OF\r\nEND_IF\r\nEND_CASE\r\n").ok,
+	checkStSyntax("VAR\r\nX: BOOL;\r\nY: INT;\r\nEND_VAR\r\nIF X THEN\r\nCASE Y OF\r\nEND_IF\r\nEND_CASE\r\n").ok,
 	false,
 	"out-of-order block close must fail"
 );
@@ -204,6 +204,14 @@ assert.strictEqual(
 	checkStSyntax("VAR\r\nIF X: BOOL;\r\nEND_VAR\r\n").ok,
 	false,
 	"IF inside declaration must fail"
+);
+// 8e. The new checker validates declaration-vs-use: an undeclared identifier
+// is a WARNING (cross-POU globals are valid), and a declared-but-unused
+// variable is a warning. Neither blocks a save.
+assert.strictEqual(
+	checkStSyntax("VAR\r\nX: BOOL;\r\nEND_VAR\r\nY := TRUE;\r\n").ok,
+	true,
+	"undeclared identifier must be a warning, not block"
 );
 
 // 9. POU boundary: a POU's text must end at its own printable run, NOT sweep

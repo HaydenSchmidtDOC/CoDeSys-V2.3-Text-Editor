@@ -1,32 +1,84 @@
 {
   "name": "codesys-v2-text-editor",
   "displayName": "CoDeSys V2.3 Text Editor",
-  "description": "Read-only decoded text view of CoDeSys V2.3 / TwinCat .pro project files",
-  "version": "0.0.1",
+  "description": "Mount CoDeSys V2.3 / TwinCat .pro project files as folders of Structured Text (.st) files - one per POU - with ST syntax highlighting and safe write-back.",
+  "version": "0.2.0",
   "publisher": "local-daifuku",
   "private": true,
   "engines": {
     "vscode": "^1.80.0"
   },
-  "categories": ["Other"],
-  "activationEvents": [],
+  "categories": [
+    "Programming Languages",
+    "Other"
+  ],
   "main": "./extension.js",
   "contributes": {
     "customEditors": [
       {
-        "viewType": "twincatProViewer.decoded",
-        "displayName": "CoDeSys V2.3 Text Editor",
+        "viewType": "codesysPou.proPicker",
+        "displayName": "CoDeSys POU Picker",
         "selector": [
           { "filenamePattern": "*.pro" }
         ],
         "priority": "default"
       }
     ],
+    "views": {
+      "explorer": [
+        {
+          "id": "codesysPou.proTree",
+          "name": "CoDeSys POUs",
+          "icon": "$(file-binary)"
+        }
+      ]
+    },
+    "languages": [
+      {
+        "id": "st",
+        "aliases": [
+          "Structured Text",
+          "ST"
+        ],
+        "extensions": [
+          ".st"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "st",
+        "scopeName": "source.st",
+        "path": "./syntaxes/st.tmLanguage.json"
+      }
+    ],
     "commands": [
       {
-        "command": "twincatProViewer.exportPous",
-        "title": "CoDeSys V2.3 Text Editor: Export Decoded POUs to Text Files"
+        "command": "codesysPou.openStFile",
+        "title": "Open POU as Structured Text"
+      },
+      {
+        "command": "codesysPou.openPro",
+        "title": "CoDeSys: Open .pro and Pick a POU"
+      },
+      {
+        "command": "codesysPou.refresh",
+        "title": "Refresh CoDeSys POUs",
+        "icon": "$(refresh)"
       }
-    ]
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "codesysPou.refresh",
+          "when": "view == codesysPou.proTree",
+          "group": "navigation"
+        }
+      ]
+    }
+  },
+  "dependencies": {
+    "vscode-uri": "^3.2.0"
   }
 }

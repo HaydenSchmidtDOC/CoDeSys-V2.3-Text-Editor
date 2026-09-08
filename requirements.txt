@@ -1,0 +1,7 @@
+# Python dependencies for the _scratch/ reverse-engineering scripts.
+# Install into the repo venv:  python -m venv .venv && .venv\Scripts\pip install -r requirements.txt
+# (On Windows PowerShell:  .\.venv\Scripts\Activate.ps1  then  pip install -r requirements.txt)
+#
+# The current _scratch/ scripts use only the Python standard library, so this
+# file is intentionally empty. Add any third-party packages here as the
+# reverse-engineering tooling grows.

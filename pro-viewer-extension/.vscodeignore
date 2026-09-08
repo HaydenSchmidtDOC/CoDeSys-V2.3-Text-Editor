@@ -1,4 +1,7 @@
 out
-node_modules
 .vscode-test
 *.vsix
+test_*.js
+validate_real_pous.js
+_debug_*.js
+_dbg*.js

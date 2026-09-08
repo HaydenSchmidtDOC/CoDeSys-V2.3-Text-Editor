@@ -6,6 +6,8 @@
 // runs of printable ASCII/CRLF text, separated from each other (and from surrounding
 // binary metadata / Visualization objects) by short non-printable framing bytes.
 
+const { checkSt } = require("./stcheck");
+
 const POU_KEYWORDS = ["PROGRAM ", "FUNCTION_BLOCK ", "FUNCTION "];
 const MIN_RUN_LENGTH = 20;
 
@@ -428,13 +430,7 @@ function assignFbWiring(node, incoming) {
 /** Renders decoded networks as a readable, clearly-labeled best-effort text block. */
 function renderLadderNetworks(networks) {
 	if (!networks.length) return "";
-	const lines = [
-		"",
-		"// --- Best-effort decoded ladder logic (read-only, NOT validated for safety-critical use) ---",
-		"// Cross-check against a real TwinCAT/CoDeSys export before relying on this. Contact/output/FB",
-		"// roles, contact negation, and AND/OR are decoded from confirmed binary tag/header bytes; a",
-		"// MIXED network's exact grouping could not be fully recovered and is left unresolved (see README).",
-	];
+	const lines = [""];
 	networks.forEach((net, idx) => {
 		let condStr;
 		let fbCalls = [];
@@ -743,7 +739,65 @@ function applyPouEdit(buf, pou, newText) {
 	const spliceEnd = hasOldMiddle ? pou.positions[oldText.length - suffixLen - 1] + 1 : spliceStart;
 
 	const middleBytes = Buffer.from(newText.slice(prefixLen, newText.length - suffixLen), "latin1");
-	return Buffer.concat([buf.subarray(0, spliceStart), middleBytes, buf.subarray(spliceEnd)]);
+	let result = Buffer.concat([buf.subarray(0, spliceStart), middleBytes, buf.subarray(spliceEnd)]);
+
+	// Two-run ST POUs store their implementation body as a SECOND printable run
+	// whose length is recorded in a 16-bit little-endian prefix (0x12 separator
+	// byte, then the length, then 2 zero bytes, then the body). If the edit
+	// changed the body's length, that prefix must be patched or the decoder
+	// will read a stale length and truncate the body on re-decode.
+	//
+	// Detect the two-run structure by searching BACKWARD from the splice for
+	// the 0x12 separator + length prefix that immediately precedes a printable
+	// body. (findImplementationRun searches forward from a start offset, which
+	// is the wrong direction here - the separator is before the body.)
+	const impl = findImplRunBefore(buf, spliceStart);
+	if (impl && spliceEnd > impl.start) {
+		// The splice touched the implementation run. Recompute the new body
+		// length: it's the distance from the run start to the end of the new
+		// body. The body's end in the new buffer is the old body end shifted by
+		// the length delta of the splice.
+		const delta = middleBytes.length - (spliceEnd - spliceStart);
+		const newImplEnd = impl.end + delta;
+		const newLen = newImplEnd - impl.start;
+		if (newLen < 0 || newLen > 0xffff) {
+			throw new Error(`Cannot save ${pou.name}: implementation body too large for the format's 16-bit length field.`);
+		}
+		// Patch the length prefix (little-endian) at sep+1..sep+2.
+		const sep = impl.start - 5; // body starts at sep+5
+		result[sep + 1] = newLen & 0xff;
+		result[sep + 2] = (newLen >> 8) & 0xff;
+	}
+
+	return result;
+}
+
+/**
+ * Finds the two-run implementation body that ends at or before `beforeOffset`,
+ * by scanning backward for the 0x12 separator + 16-bit LE length + 2 zero
+ * bytes + printable body pattern. Returns { start, end } of the body, or null.
+ * This is the reverse-direction counterpart to findImplementationRun (which
+ * scans forward from a start offset) - needed by applyPouEdit to locate the
+ * length prefix that precedes a splice point inside the body.
+ */
+function findImplRunBefore(buf, beforeOffset) {
+	// Scan backward a bounded window for a 0x12 separator byte.
+	const windowStart = Math.max(0, beforeOffset - 4096);
+	for (let i = beforeOffset - 1; i >= windowStart; i--) {
+		if (buf[i] !== 0x12) continue;
+		const len = buf[i + 1] + (buf[i + 2] << 8);
+		const bodyStart = i + 5;
+		const bodyEnd = bodyStart + len;
+		if (len <= 0 || bodyEnd > buf.length) continue;
+		// The body must be printable text and must contain the splice point.
+		if (bodyStart > beforeOffset || bodyEnd < beforeOffset) continue;
+		let printable = true;
+		for (let j = bodyStart; j < bodyEnd; j++) {
+			if (!isPrintable(buf[j])) { printable = false; break; }
+		}
+		if (printable) return { start: bodyStart, end: bodyEnd };
+	}
+	return null;
 }
 
 // Block keywords that must balance 1:1 with their closer within a single
@@ -759,201 +813,19 @@ const ST_BLOCK_PAIRS = [
 	[/\bREPEAT\b/gi, /\bEND_REPEAT\b/gi],
 ];
 
-// Keywords that open a block but have NO closer (they close implicitly at the
-// end of the enclosing block / POU). A stray one mid-implementation is a
-// likely syntax slip, so flag it.
-const ST_IMPLICIT_CLOSE = new Set(["ELSE", "ELSIF", "ELSEIF", "RETURN", "EXIT"]);
-
-// Keywords that must NOT appear inside a declaration block (VAR...END_VAR).
-const ST_DECL_ONLY = new Set(["VAR", "VAR_INPUT", "VAR_OUTPUT", "VAR_IN_OUT", "VAR_GLOBAL", "VAR_EXTERNAL", "VAR_STAT", "VAR_TEMP"]);
-
-// Keywords that must NOT appear inside an implementation block (they only
-// make sense in declarations).
-const ST_IMPL_ONLY = new Set(["IF", "CASE", "FOR", "WHILE", "REPEAT", "RETURN", "EXIT"]);
-
 /**
- * Tokenizes Structured Text into a stream of { type, value, line } tokens,
- * stripping comments and string literals so keywords inside them don't count.
- * Types: "word", "num", "str", "punct", "newline", "eof".
- */
-function tokenizeSt(text) {
-	const tokens = [];
-	let i = 0, line = 1;
-	const n = text.length;
-	while (i < n) {
-		const c = text[i];
-		if (c === "\r" || c === "\n") {
-			if (c === "\n") line++;
-			i++;
-			tokens.push({ type: "newline", value: c, line });
-			continue;
-		}
-		if (c === " " || c === "\t") { i++; continue; }
-		// Comment: (* ... *) or // ... to end of line
-		if (c === "(" && text[i + 1] === "*") {
-			const end = text.indexOf("*)", i + 2);
-			if (end === -1) return { tokens, error: `Unterminated comment starting line ${line}.` };
-			line += (text.slice(i, end).match(/\n/g) || []).length;
-			i = end + 2;
-			continue;
-		}
-		if (c === "/" && text[i + 1] === "/") {
-			const nl = text.indexOf("\n", i);
-			i = nl === -1 ? n : nl;
-			continue;
-		}
-		// String literal: '...' (ST uses single quotes)
-		if (c === "'") {
-			let j = i + 1;
-			while (j < n && text[j] !== "'") {
-				if (text[j] === "\n") line++;
-				j++;
-			}
-			if (j >= n) return { tokens, error: `Unterminated string literal starting line ${line}.` };
-			tokens.push({ type: "str", value: text.slice(i, j + 1), line });
-			i = j + 1;
-			continue;
-		}
-		// Number (incl. time literals like T#6000ms, hex 16#FF)
-		if (/[0-9]/.test(c) || (c === "T" && text[i + 1] === "#") || (c === "1" && text[i + 1] === "6" && text[i + 2] === "#")) {
-			let j = i;
-			while (j < n && /[0-9A-Za-z_#.]/.test(text[j])) j++;
-			tokens.push({ type: "num", value: text.slice(i, j), line });
-			i = j;
-			continue;
-		}
-		// Word / identifier
-		if (/[A-Za-z_]/.test(c)) {
-			let j = i;
-			while (j < n && /[A-Za-z0-9_]/.test(text[j])) j++;
-			tokens.push({ type: "word", value: text.slice(i, j), line });
-			i = j;
-			continue;
-		}
-		// Punctuation / operators
-		if ("()[];:.,:=+-*/<>=&".includes(c)) {
-			// multi-char operators
-			const two = text.slice(i, i + 2);
-			if (two === ":=" || two === "<>" || two === "<=" || two === ">=" || two === "..") {
-				tokens.push({ type: "punct", value: two, line });
-				i += 2;
-				continue;
-			}
-			tokens.push({ type: "punct", value: c, line });
-			i++;
-			continue;
-		}
-		// Unknown char - skip but note it
-		tokens.push({ type: "punct", value: c, line });
-		i++;
-	}
-	tokens.push({ type: "eof", value: "", line });
-	return { tokens };
-}
-
-/**
- * Real (if lightweight) Structured Text syntax check for edited POUs. Unlike
- * the old keyword-counting check, this tokenizes the text (so keywords inside
- * comments/strings don't count), tracks block nesting with a stack, and
- * catches: unbalanced blocks, a block closed out of order, a stray ELSE/ELSIF
- * outside an IF, a declaration keyword inside the implementation, an
- * implementation keyword inside a declaration, and unbalanced parens/brackets.
- * It is still not a full IEC 61131-3 parser (no type checking, no
- * declaration-vs-use validation) and is not a substitute for a Rebuild in
- * TwinCat. Returns { ok: true } or { ok: false, error }.
+ * Thin wrapper around the full ST syntax checker in stcheck.js (see
+ * docs/syntax-checker-plan.md). Kept for backward compatibility with the
+ * extension's save path and existing tests: returns { ok: true } or
+ * { ok: false, error } where `error` is the first error diagnostic's message.
+ * The richer { ok, diagnostics } shape (line/col/severity/code) is available
+ * directly from stcheck.js's checkSt().
  */
 function checkStSyntax(text) {
-	const { tokens, error } = tokenizeSt(text);
-	if (error) return { ok: false, error };
-
-	const stack = []; // { kind, line }
-	let inDecl = false; // inside a VAR...END_VAR block
-	let declDepth = 0;
-	let parenDepth = 0, bracketDepth = 0;
-	let lastSignificant = null; // last non-newline token, for statement-start detection
-
-	for (const tok of tokens) {
-		if (tok.type === "newline" || tok.type === "eof") continue;
-		const up = tok.value.toUpperCase();
-
-		if (tok.type === "punct") {
-			if (tok.value === "(") parenDepth++;
-			else if (tok.value === ")") {
-				parenDepth--;
-				if (parenDepth < 0) return { ok: false, error: `Unbalanced parentheses: closed one that was never opened (line ${tok.line}).` };
-			} else if (tok.value === "[") bracketDepth++;
-			else if (tok.value === "]") {
-				bracketDepth--;
-				if (bracketDepth < 0) return { ok: false, error: `Unbalanced brackets: closed one that was never opened (line ${tok.line}).` };
-			}
-			lastSignificant = tok;
-			continue;
-		}
-		if (tok.type !== "word") { lastSignificant = tok; continue; }
-
-		// Declaration block tracking
-		if (ST_DECL_ONLY.has(up)) {
-			if (inDecl) return { ok: false, error: `Nested ${up} inside a declaration block (line ${tok.line}).` };
-			inDecl = true;
-			declDepth = 0;
-			stack.push({ kind: "VAR", line: tok.line });
-			lastSignificant = tok;
-			continue;
-		}
-		if (up === "END_VAR") {
-			if (!inDecl) return { ok: false, error: `END_VAR without a matching VAR (line ${tok.line}).` };
-			inDecl = false;
-			stack.pop();
-			lastSignificant = tok;
-			continue;
-		}
-
-		// Block openers / closers
-		const openers = { IF: "END_IF", CASE: "END_CASE", FOR: "END_FOR", WHILE: "END_WHILE", REPEAT: "END_REPEAT" };
-		const closers = { END_IF: "IF", END_CASE: "CASE", END_FOR: "FOR", END_WHILE: "WHILE", END_REPEAT: "REPEAT" };
-		if (openers[up]) {
-			if (inDecl) return { ok: false, error: `${up} inside a declaration block (line ${tok.line}).` };
-			stack.push({ kind: up, line: tok.line });
-			lastSignificant = tok;
-			continue;
-		}
-		if (closers[up]) {
-			if (inDecl) return { ok: false, error: `${up} inside a declaration block (line ${tok.line}).` };
-			const top = stack[stack.length - 1];
-			if (!top || top.kind !== closers[up]) {
-				return { ok: false, error: `${up} without a matching ${closers[up]} (line ${tok.line}).` };
-			}
-			stack.pop();
-			lastSignificant = tok;
-			continue;
-		}
-
-		// ELSE / ELSIF must be inside an IF
-		if (up === "ELSE" || up === "ELSIF" || up === "ELSEIF") {
-			if (inDecl) return { ok: false, error: `${up} inside a declaration block (line ${tok.line}).` };
-			if (!stack.some((s) => s.kind === "IF")) {
-				return { ok: false, error: `${up} outside an IF block (line ${tok.line}).` };
-			}
-			lastSignificant = tok;
-			continue;
-		}
-
-		// Implementation-only keywords must not be in declarations
-		if (inDecl && ST_IMPL_ONLY.has(up)) {
-			return { ok: false, error: `${up} inside a declaration block (line ${tok.line}).` };
-		}
-
-		lastSignificant = tok;
-	}
-
-	if (inDecl) return { ok: false, error: "Unterminated declaration block: missing END_VAR." };
-	if (parenDepth !== 0) return { ok: false, error: `Unbalanced parentheses: ${parenDepth} unclosed.` };
-	if (bracketDepth !== 0) return { ok: false, error: `Unbalanced brackets: ${bracketDepth} unclosed.` };
-	if (stack.length) {
-		const top = stack[stack.length - 1];
-		return { ok: false, error: `Unclosed ${top.kind} block (opened line ${top.line}).` };
-	}
-	return { ok: true };
+	const { ok, diagnostics } = checkSt(text);
+	if (ok) return { ok: true };
+	const first = diagnostics.find((d) => d.severity === "error") || diagnostics[0];
+	return { ok: false, error: `Line ${first.line}: ${first.message}` };
 }
 
 module.exports = { decodePro, applyPouEdit, decodeLadderBody, renderLadderNetworks, checkStSyntax };

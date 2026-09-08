@@ -1,4 +1,6 @@
 node_modules/
+.venv/
+*.vsix
 *.vsix.map
 /TEST CORPUS/
 /_extracted_pous/
