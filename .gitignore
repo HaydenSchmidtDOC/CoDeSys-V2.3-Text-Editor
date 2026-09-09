@@ -4,7 +4,7 @@ node_modules/
 *.vsix.map
 /TEST CORPUS/
 /_extracted_pous/
-*.pro
+/TEST CORPUS/*.pro
 *.EXP
 *.exp
 *.BAK
