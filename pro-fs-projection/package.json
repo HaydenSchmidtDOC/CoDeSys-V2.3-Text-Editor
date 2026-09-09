@@ -1,0 +1,19 @@
+{
+  "name": "pro-fs-projection",
+  "version": "0.1.0",
+  "description": "Filesystem deception layer for .pro files - makes a .pro binary appear as a directory tree",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "node dist/test/test-harness.js",
+    "test:verbose": "node --trace-warnings dist/test/test-harness.js"
+  },
+  "dependencies": {
+    "codesys-parser": "../codesys-parser"
+  },
+  "devDependencies": {
+    "typescript": "^5.2.0",
+    "@types/node": "^20.5.0"
+  }
+}

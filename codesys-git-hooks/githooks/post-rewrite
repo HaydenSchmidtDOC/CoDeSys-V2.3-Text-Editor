@@ -1,0 +1,14 @@
+#!/bin/sh
+# post-rewrite hook - rebuild .pro from projections
+# Run after rebase, amend, etc.
+
+REPO_ROOT=$(git rev-parse --show-toplevel)
+HOOKS_DIR="$REPO_ROOT/codesys-git-hooks"
+
+if [ ! -d "$HOOKS_DIR" ]; then
+  exit 0
+fi
+
+# Call the TypeScript hook implementation
+node "$HOOKS_DIR/dist/post-rewrite.js" "$REPO_ROOT" 2>/dev/null
+exit 0

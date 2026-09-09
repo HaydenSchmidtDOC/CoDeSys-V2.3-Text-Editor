@@ -1,0 +1,14 @@
+#!/bin/sh
+# pre-commit hook - export .pro projections and detect drift
+# Run from the root of the repository
+
+REPO_ROOT=$(git rev-parse --show-toplevel)
+HOOKS_DIR="$REPO_ROOT/codesys-git-hooks"
+
+if [ ! -d "$HOOKS_DIR" ]; then
+  echo "Error: codesys-git-hooks not found at $HOOKS_DIR"
+  exit 1
+fi
+
+# Call the TypeScript hook implementation
+node "$HOOKS_DIR/dist/pre-commit.js" "$REPO_ROOT"

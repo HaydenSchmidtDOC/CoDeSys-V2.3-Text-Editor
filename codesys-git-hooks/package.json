@@ -1,0 +1,22 @@
+{
+  "name": "codesys-git-hooks",
+  "version": "0.1.0",
+  "description": "Git hooks for automatic .pro export/import projection sync. Maintains Airport.pro.src/ alongside Airport.pro with deterministic, human-readable POUS/*.st + GVL/*.gvl + DUT/*.dut + Tasks/*.json.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "tsc -p tsconfig.json && node --test dist/test/*.test.js"
+  },
+  "bin": {
+    "codesys-git-hooks-install": "dist/install.js"
+  },
+  "license": "UNLICENSED",
+  "dependencies": {
+    "codesys-parser": "../codesys-parser"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.4",
+    "@types/node": "^20.14.0"
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "name": "codesys-parser",
+  "version": "0.1.0",
+  "description": "Standalone TypeScript parser core for TwinCAT 2 / CoDeSys V2.3 .pro binaries. Span-preserving, byte-exact round-trip. No VS Code dependency.",
+  "main": "dist/src/index.js",
+  "types": "dist/src/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "prepare": "npm run build",
+    "test": "tsc -p tsconfig.json && node --test dist/test/*.test.js"
+  },
+  "license": "UNLICENSED",
+  "devDependencies": {
+    "typescript": "^5.5.4",
+    "@types/node": "^20.14.0"
+  }
+}
