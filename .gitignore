@@ -9,3 +9,4 @@ node_modules/
 *.exp
 *.BAK
 *.bak
+.serena/
