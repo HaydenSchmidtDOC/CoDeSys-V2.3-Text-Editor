@@ -122,6 +122,7 @@ class Obj:
         "mid_off", "mid_len",
         "decl_len_off", "decl_off", "decl_len",
         "tag", "body_off", "body_len", "nnet",
+        "kind_hint",
     )
 
     @property
